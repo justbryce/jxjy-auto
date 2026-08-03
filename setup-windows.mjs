@@ -63,7 +63,7 @@ if (!SCREEN_W) {
 }
 if (!SCREEN_W) SCREEN_W = 1920;
 log(`桌面范围 x=${SCREEN_X0}..${SCREEN_X0 + SCREEN_W}（宽 ${SCREEN_W}px）`);
-const COLS = W + 1;                                      // +1 给 zjsjczx
+const COLS = W + 1;   // 层叠步长按 W+1 算，给 zj 在最右边留出一条露出来的余量
 // 窗口**层叠**排布，不是并排。
 // 关键：macOS 的遮挡判定要求**完全**被盖住才算 occluded —— 所以每个窗口只要露出一条边就够了，
 // 不需要各自占一整列。并排的话 1920 宽最多摆 4 个（Chrome 有约 400px 的最小窗口宽度，
@@ -72,14 +72,37 @@ const COLS = W + 1;                                      // +1 给 zjsjczx
 // 就能开到十几个 worker 都保持 visible。
 const MINW = 400;                                        // Chrome 最小窗口宽度，比这窄它会自己拉宽
 const STEP = Math.max(48, Math.floor((SCREEN_W - MINW) / COLS));
+// 窗口**宽度**和层叠步长是两回事：步长决定每个窗口露出多宽的一条（可见性判定用），
+// 宽度决定页面视口有多宽（页面布局用）。两者不必相等。
+// 宽度**按站点分别给**，别一刀切：
+//   · 163 用最小宽度就够，它的播放页在窄屏下正常。
+//   · 浙江工信必须给宽：400px 时站点切成窄屏布局，左侧导航菜单直接压在 <video> 上面，
+//     合成点击点到菜单项，把页面带去别的路由（表现是"课件坏了"，差点误杀一堆好课）。
+// 🔴 也别一刀切给宽：10 个 1100px 宽的窗口同时渲染视频，Chrome 会被压到
+//    连 AppleEvent 都超时。渲染面积是有成本的，只给需要的那个。
 const CW = Math.max(MINW, STEP);
-const WIN_TOP = 25, WIN_BOT = 520;
+const CW_WIDE = Math.max(CW, Number(process.env.WIN_WIDTH || 1100));
+// 窗口要**够高**。层叠只需要顶部那条 (25~122) 露出来，高度不影响可见性判定，
+// 但太矮会让页面视口装不下播放器 —— 实测 495 高时视口只有 400×318，
+// 而浙江工信的 <video> 中心在 y=355，**落在视口外**：CDP 的真实鼠标点击派发到视口外，
+// 结果点到了顶部导航栏，把页面带去了别的路由（差点被误判成"课件坏了"）。
+const WIN_TOP = 25, WIN_BOT = Number(process.env.WIN_BOTTOM || 1000);
 // Chrome 会把顶边夹到菜单栏下沿（25 → 30），底边跟着平移。回收旧窗口时要按这组读回值匹配。
 const WIN_TOP_READBACK = 30, WIN_BOT_READBACK = WIN_BOT + (WIN_TOP_READBACK - WIN_TOP);
-const col = i => [SCREEN_X0 + i * STEP, WIN_TOP, SCREEN_X0 + i * STEP + CW, WIN_BOT];
+const col = (i, w = CW) => [SCREEN_X0 + i * STEP, WIN_TOP, SCREEN_X0 + i * STEP + w, WIN_BOT];
+
+// zj 是**串行**的（一次只播一门），所以给它一个正常大小的窗口，别跟着 163 一起挤成小条。
+// 摆法：zj 贴着屏幕右边先建（在 z 序底层），163 那一串再从左边层叠上去；
+// 只要最后一个 163 窗口的右边缘没盖到屏幕最右边，zj 右侧就一直露着一条 → 保持 visible。
+// （之前把 zj 塞在层叠的最后一列，它有一大半在屏幕外，页面被压成窄屏布局，
+//   左侧导航菜单直接盖在 <video> 上，合成点击点到菜单项把页面带跑 —— 排查了很久。）
+const ZJ_X = SCREEN_X0 + SCREEN_W - CW_WIDE;
+const lastRight = SCREEN_X0 + (W - 1) * STEP + CW;
+if (lastRight >= SCREEN_X0 + SCREEN_W - 40)
+  log(`⚠ 最后一个 163 窗口右边缘 ${lastRight} 快贴到屏幕右边 ${SCREEN_X0 + SCREEN_W} 了，zj 可能被完全盖住`);
 
 const PLAN = [
-  { key: 'zj', file: 'zjsjczx.json', field: 'target', bounds: col(COLS - 1), url: 'https://engineer.zjsjczx.org.cn/zg/student/learning-center' },
+  { key: 'zj', file: 'zjsjczx.json', field: 'target', bounds: [ZJ_X, WIN_TOP, ZJ_X + CW_WIDE, WIN_BOT], url: 'https://engineer.zjsjczx.org.cn/zg/student/learning-center' },
   ...Array.from({ length: W }, (_, i) => ({
     key: `163-w${i}`, file: 'study163.json', field: `tab${i}`, bounds: col(i),
     url: 'https://study.163.com/my#/courses',
@@ -101,14 +124,15 @@ const allIds = async () => new Set((await cdp.findTabs(() => true)).map(t => t.t
 //
 // 按**窗口几何**扫，不按 state 里记的 tab id：state 只记得最后一次的 id，
 // 中途异常退出、或者连着跑两次，前面那批就永远没人回收了。
-// ⚠️ Chrome 会把 y=25 夹成 30、bottom 相应变 525（菜单栏），所以匹配的是**读回来的**值，
-//    不是我们设进去的值。改了 col() 的 y 记得同步改这里。
+// ⚠️ 只按**顶边**匹配（Chrome 把 y=25 夹成 30），不要连底边一起匹配 ——
+//    调整过窗口高度之后，旧窗口的底边和新签名对不上，就永远回收不掉了（实测攒到 24 个）。
+//    顶边 30 这个特征足够独特：正常窗口不会正好贴在菜单栏下沿。
 try {
   const n = osaProbe('tell application "Google Chrome"',
     'set k to 0',
     'repeat with i from (count of windows) to 1 by -1',
     '  set b to bounds of window i',
-    `  if (item 2 of b) = ${WIN_TOP_READBACK} and (item 4 of b) = ${WIN_BOT_READBACK} then`,
+    `  if (item 2 of b) = ${WIN_TOP_READBACK} then`,
     '    close window i',
     '    set k to k + 1',
     '  end if',
@@ -128,8 +152,19 @@ for (const p of PLAN) {
       `set bounds of w to {${p.bounds.join(', ')}}`,
       'end tell');
   await sleep(5000);
-  const after = await allIds();
-  const id = [...after].find(x => !before.has(x));
+  // 🔴 差集**不够**：这个 Chrome 里可能还跑着别人的自动化，它们也会在这几秒里开 tab。
+  //    只按差集认，就可能把别人的 tab 写进我们的 state，然后 runner 一跑就把人家的页面导航走。
+  //    （实测踩到：zj 的 target 被写成了任天堂抢票监控的 tab。）
+  //    所以差集之后**必须再用 URL 复核**：只认 host 对得上的那个。
+  const host = new URL(p.url).host;
+  const fresh = (await cdp.findTabs(t => !before.has(t.targetId)));
+  const mine = fresh.filter(t => { try { return new URL(t.url).host === host; } catch { return false; } });
+  if (fresh.length && !mine.length) {
+    log(`❌ ${p.key} 新出现了 ${fresh.length} 个 tab 但没有一个是 ${host} —— 全是别人开的，跳过（绝不能乱认）`);
+    continue;
+  }
+  if (mine.length > 1) log(`⚠ ${p.key} 有 ${mine.length} 个新 tab 都是 ${host}，取第一个`);
+  const id = mine[0]?.targetId;
   if (!id) { log(`❌ ${p.key} 没认出新建的 tab`); continue; }
 
   const f = path.join(HERE, 'state', p.file);

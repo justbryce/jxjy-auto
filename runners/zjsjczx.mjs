@@ -65,10 +65,13 @@ async function startPlayback(target, c, { forceFront = false, allowResume = fals
     return JSON.stringify({ready:v?v.readyState:-1})})()`).catch(() => null);
   if (forceFront || !pre || pre.ready < 2) await cdp.kickVisible(target, { waitMs: 4000, tag: 'zj' });
 
-  // 先等视频真的加载出来再 play。有些课件的 src 是后端签发的
-  // （/jeecg-boot/zg/courseware/video/play?coursewareId=..&token=..，不是 OSS 直链），
-  // 拿到 src 要好几秒；这期间 play() 会抛 NotSupportedError，白白耗掉一轮重试。
-  for (let i = 0; i < 12; i++) {
+  // 先等视频真的加载出来再 play。两个原因都要等：
+  //  ① 有些课件的 src 是后端签发的（/jeecg-boot/zg/courseware/video/play?coursewareId=..&token=..，
+  //     不是 OSS 直链），拿到 src 要好几秒；这期间 play() 会抛 NotSupportedError。
+  //  ② 🔑 **页面自己有重试和备用源机制**：主源拉不动时它会重试到上限，再自动换备用源播成功。
+  //     整个过程能到一分钟以上。等不够就会误判成"课件坏了"（实测：人工点进去看，
+  //     它就是"重试达到最大次数 → 用备用源成功播放"）。所以这里要有耐心。
+  for (let i = 0; i < 32; i++) {
     const st = await evalJson(target, `(()=>{const v=document.querySelector("video");
       window.__playErr=null;                      // 清掉上一轮的残留错误，否则会一直报同一个
       if(!v) return JSON.stringify({ready:-1});
@@ -79,8 +82,41 @@ async function startPlayback(target, c, { forceFront = false, allowResume = fals
 
   // 真实点击 video 元素本身取得用户手势。注意：点 .video-container 中心有可能落在进度条上导致误 seek，
   // 所以点完立刻把 currentTime 显式写回我们要的位置。
-  await evalJs(target, `(()=>{const v=document.querySelector("video");if(v)v.id="__pv";return 1})()`).catch(() => { });
-  await cdp.clickAt(target, '#__pv').catch(() => { });
+  //
+  // 🔴 **点之前必须确认 <video> 真的有尺寸。** 播放器还没布局完时它的 rect 是 0×0，
+  //    合成点击就落到视口 (0,0) —— 那儿是站点顶部导航栏，一下把页面点到「学时申请」页去了。
+  //    之后页面里再也没有 <video>，整轮起播全失败，看起来就像"课件坏了"（差点误杀一堆好课）。
+  //    本站 volume=0 播放本来就不需要用户手势，拿不到就不拿，别硬点。
+  const rect = await evalJson(target, `(()=>{const v=document.querySelector("video");
+    if(!v) return JSON.stringify({none:true});
+    v.scrollIntoView({block:"center"});          // 先滚进视口，窗口矮的时候全靠这一步
+    const r=v.getBoundingClientRect();
+    const cx=r.left+r.width/2, cy=r.top+r.height/2;
+    // 判据不是"元素有尺寸"，而是"**中心点确实落在视口内、而且那里就是它自己**"。
+    // 元素有尺寸但中心在视口外时，合成点击会被派发到视口边缘 → 点到导航栏。
+    // 命中判据不能死抠"必须正好是 <video>" —— 播放器普遍会在视频上盖一层透明的控制层/海报层，
+    // 那样永远判不过。只要点到的东西**在播放器容器里**就行（点它照样能拿到用户手势），
+    // 关键是排除"点到了播放器外面"（那才是会把页面点跑的情况）。
+    const hit = document.elementFromPoint(cx,cy);
+    const box = v.closest(".video-container") || v.parentElement || v;
+    const ok = r.width>60 && r.height>60 && cx>=0 && cy>=0 && cx<innerWidth && cy<innerHeight
+               && !!hit && (hit===v || box.contains(hit));
+    if(ok) v.id="__pv";
+    return JSON.stringify({ok,w:Math.round(r.width),h:Math.round(r.height),
+      cy:Math.round(cy),vh:innerHeight,hit:hit?(hit.tagName+"."+hit.className).slice(0,40):null})})()`).catch(() => null);
+  if (rect && rect.ok) {
+    const before = await evalJs(target, 'location.href').catch(() => null);
+    await cdp.clickAt(target, '#__pv').catch(() => { });
+    // 兜底：万一还是点飞了（页面改版、播放器换皮肤…），立刻发现并退回来，别让它一路错下去
+    const after = await evalJs(target, 'location.href').catch(() => null);
+    if (before && after && before !== after) {
+      log(`  ⚠ 真实点击把页面带走了（→ ${String(after).split('/').pop()}），退回播放页且本轮不再点`);
+      await cdp.navigate(target, before);
+      await sleep(5000);
+    }
+  } else if (rect && !rect.none) {
+    log(`  点击点不在播放器内（${rect.w}×${rect.h}，中心 y=${rect.cy}/视口 ${rect.vh}，命中 ${rect.hit}），跳过真实点击 —— 硬点会点到导航栏`);
+  }
 
   // ⚠️ 不要 await v.play()：视频加载不动时那个 Promise 永不 settle，会把 CDP eval 挂到超时。
   // allowResume=true 表示页面没有重新加载（同 URL navigate），视频还在原地真实播着，别去动它的位置。
@@ -106,7 +142,7 @@ async function startPlayback(target, c, { forceFront = false, allowResume = fals
   // 页面是新加载的，视频本该从 0 起。若此刻位置远超我们要的起点，说明真实鼠标点击落在了进度条上把它 seek 走了。
   // 服务端按上报的 currentTime 取最大值记 longesttime —— 那等于白拿没看过的进度，必须纠正回来。
   const fixed = await evalJson(target, `(()=>{const v=document.querySelector("video");
-    if(!v) return JSON.stringify({none:true});
+    if(!v) return JSON.stringify({none:true,url:location.href});
     let jumped=false;
     if(v.currentTime > ${seekTo} + 15){ v.currentTime=${seekTo}; jumped=true;
       try{const p=v.play();if(p&&p.catch)p.catch(()=>{})}catch(e){} }
@@ -114,6 +150,11 @@ async function startPlayback(target, c, { forceFront = false, allowResume = fals
   if (fixed?.jumped) log(`  ⚠ 起播位置被误 seek，已拉回 ${seekTo}s`);
   return fixed;
 }
+
+// 本次进程内的软跳过：原因不明的起播失败先绕开，别原地打转。
+// **不落盘** —— 落盘的只有确认是课件源坏了的（NotSupportedError），见 playCourse 里的注释。
+const softSkip = new Set();
+let noVideoStreak = 0;
 
 async function playCourse(target, c) {
   log(`▶ 《${c.title}》 id=${c.id} ${Math.round(c.len / 60)}分钟 ${c.ct}学时 已看${Math.round(c.p * 100)}%`);
@@ -125,21 +166,48 @@ async function playCourse(target, c) {
   const sameDoc = !!(await evalJs(target, `!!window.__navMark`).catch(() => false));
   if (sameDoc) log('  （页面未重载，接着上次的位置继续播）');
 
-  let started = false;
+  let started = false, k = null;
   for (let i = 0; i < 5 && !started; i++) {
-    const k = await startPlayback(target, c, { forceFront: i > 0, allowResume: sameDoc });
+    k = await startPlayback(target, c, { forceFront: i > 0, allowResume: sameDoc });
     if (k && !k.none && !k.paused && k.ready >= 2) { started = true; break; }
     log('  启动重试', i + 1, JSON.stringify(k));
     await sleep(5000);
   }
   if (!started) {
-    // 🔴 有的课件视频源本身是坏的（`NotSupportedError`：Chrome 认不了这个源，重试多少次都没用）。
-    //    只 return 'retry' 而不落盘，上层下一轮会**按同样的排序规则又选中它** → 4 分钟一圈死循环。
-    //    （2026-08-03 踩到：id=166《网络舆情监测的核心要素与工作机制》这么空转了半小时。）
-    //    所以要持久化跳过，别让它再被选中。
-    (state.data.skip ||= []).push(String(c.id));
-    state.save();
-    log(`  启动失败（起播 5 次都没成，多半是课件源坏了），拉黑 id=${c.id} 不再选`);
+    // 🔴 起播失败分两种，**必须分开处理**，否则会一门门误杀好课。
+    //
+    //  ① 页面里根本没有 <video>（`{none:true}`）—— 这是**页面/标签页**的问题，
+    //     不是这门课的问题。tab 跑到别的路由上了、页面没渲染出来、Vue 还没挂载，都会这样。
+    //     这种要重建 tab 重试，**绝对不能拉黑**。
+    //     （2026-08-03 踩到：一股脑拉黑，20 分钟里把 9 门完全正常的课误杀了。）
+    //
+    //  ② `NotSupportedError` —— Chrome 认不了这个源，课件本身是坏的，重试多少次都没用。
+    //     这种才要持久化拉黑：只 return 'retry' 的话，上层下一轮会按同样的排序规则
+    //     **又选中它** → 4 分钟一圈死循环（id=166 这么空转过半小时）。
+    if (k?.none) {
+      noVideoStreak++;
+      log(`  页面里没有 <video>（当前 URL: ${k.url || '?'}），是页面没加载好、不是课件的问题 —— 重建 tab 重试，不拉黑`);
+      state.data.target = null; state.save();
+      if (noVideoStreak >= 4) {
+        // 连着换 tab 都还是没有 <video> —— 那就不是偶发，是登录态掉了/站点改版/整个 Chrome 有问题。
+        // 这时候继续高频重试只会刷屏，而且掩盖真问题。歇久一点并留下告警。
+        log(`  🚨 连续 ${noVideoStreak} 门都拿不到 <video>，多半是登录态失效或站点异常，等 10 分钟`);
+        noVideoStreak = 0;
+        await sleep(600_000);
+      }
+      return 'retry';
+    }
+    noVideoStreak = 0;
+    if (k?.err === 'NotSupportedError') {
+      (state.data.skip ||= []).push(String(c.id));
+      state.save();
+      log(`  ⛔ 课件源 Chrome 认不了（NotSupportedError），拉黑 id=${c.id} 不再选`);
+      return 'retry';
+    }
+    // 其他失败（超时、readyState 上不去…）原因不明，不拉黑，但本次进程内先跳过，
+    // 免得下一轮又按同样的排序选中它、原地打转。重启进程就会重新尝试。
+    softSkip.add(String(c.id));
+    log(`  启动失败（${JSON.stringify(k)}），本次运行内先跳过，不拉黑`);
     return 'retry';
   }
 
@@ -220,7 +288,7 @@ async function loop() {
     for (const type of [3, 1, 2]) {           // 行业公需 → 专业科目 → 一般公需
       const list = await getCourses(target, type);
       if (!list) continue;
-      const todo = list.filter(x => x.p < 1 && !skip.has(String(x.id)));
+      const todo = list.filter(x => x.p < 1 && !skip.has(String(x.id)) && !softSkip.has(String(x.id)));
       if (!todo.length) continue;
       // 按「还要看多久换 1 学时」排序，最省时间的先看
       todo.sort((a, b) => (a.len - Math.min(a.lt, a.len)) / (a.ct || 0.5) - (b.len - Math.min(b.lt, b.len)) / (b.ct || 0.5));

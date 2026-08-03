@@ -92,7 +92,10 @@ async function nc() {
 const NAME = { zjsjczx: '浙江工信', hzrs: '新干线', study163: '网易云课堂' };
 
 function parseActivity(site, lines) {
-  const L = lines.slice(-200);
+  // 扫描窗口要够大：worker 一多，每个 worker 最近一条「▶ 开始学某课时」的日志
+  // 就会被别的 worker 的进度行挤到很靠前。窗口太小会让后面的 worker 直接消失
+  // （踩过：10 路的时候面板只显示得出 6 个）。
+  const L = lines.slice(site === 'study163' ? -1200 : -200);
   const last = re => { for (let i = L.length - 1; i >= 0; i--) { const m = L[i].match(re); if (m) return m; } return null; };
 
   if (site === 'zjsjczx') {
@@ -113,8 +116,13 @@ function parseActivity(site, lines) {
 
   // 163 按 worker 分开。日志格式：  w0 ▶ 《课程名》 课时1 课时名 08:30
   // （早期是「▶ 课时1 《课时名》」，改成按课时分派队列后课程名挪到了前面 —— 两种都兼容一下）
+  // ⚠️ worker 列表要从日志里**现推**，不能写死。
+  //    原来写死成 w0..w5，把并发调到 10 之后多出来的 4 个就静默消失了 ——
+  //    而它们其实跑得好好的，只是面板看不见。
+  const ws = [...new Set(L.flatMap(l => l.match(/\bw(\d+)\b/g) || []))]
+    .sort((a, b) => Number(a.slice(1)) - Number(b.slice(1)));
   const out = [];
-  for (const w of ['w0', 'w1', 'w2', 'w3', 'w4', 'w5']) {
+  for (const w of ws) {
     const cNew = last(new RegExp(`${w} ▶ 《(.+?)》\\s*(课时\\d+)\\s*(.*)$`));
     const cOld = cNew ? null : last(new RegExp(`${w} ▶ (课时\\d+) 《(.+?)》`));
     if (!cNew && !cOld) continue;
@@ -251,11 +259,13 @@ function render(d) {
   }
 
   const rs = d.runners.map(r => {
-    const act = (r.act || []).map(a => {
+    const many = (r.act || []).length >= 5;
+    const items = (r.act || []).map(a => {
       const slow = a.rate != null && a.rate < 70;
       return `<div class="act"><div class="aw">${a.w ? `<span class="wk">${a.w}</span>` : ''}${esc(a.what)}</div>
         <div class="ah">${esc(a.how)}${a.rate != null ? ` · <span class="${slow ? 'slow' : 'okr'}">速率 ${a.rate}%</span>` : ''}</div></div>`;
-    }).join('') || '<div class="dim">（还没开始）</div>';
+    }).join('');
+    const act = items ? (many ? `<div class="acts">${items}</div>` : items) : '<div class="dim">（还没开始）</div>';
     // 异常报警要带时间戳 —— 不然分不清"刚刚炸了"还是"六小时前炸过一次已经自愈了"。
     // 同样倒序，最新的在最上面。
     const bad = r.bad?.length
@@ -264,8 +274,9 @@ function render(d) {
         const [when, what] = m ? [`${m[1].slice(5)} ${m[2]}`, m[3]] : ['', x];
         return `<br><span class="ts">${esc(when)}</span> ${esc(what)}`;
       }).join('')}</div>` : '';
-    return `<div class="r ${r.alive ? 'on' : 'off'}">
-      <b>${r.name}</b> <span class="dim">${r.alive ? '运行中' : '已停止'}</span>
+    const n = (r.act || []).length;
+    return `<div class="r ${r.alive ? 'on' : 'off'}${many ? ' wide' : ''}">
+      <b>${r.name}</b> <span class="dim">${r.alive ? '运行中' : '已停止'}${n > 1 ? ` · ${n} 路并行` : ''}</span>
       ${act}${bad}
       <details><summary>原始日志（新 → 旧）</summary><pre>${esc(r.tail)}</pre></details></div>`;
   }).join('');
@@ -304,6 +315,11 @@ ul.cur li{margin:3px 0}
 .tag{font-size:11px;color:var(--dim);border:1px solid var(--line);border-radius:4px;padding:0 4px}
 .err{color:#c8443c;font-size:13px}
 .runners{margin-top:20px;display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(300px,1fr))}
+/* worker 多的时候（网易云 10 路）这张卡横跨整行，activity 排成网格，
+   不然 10 条竖着堆会把页面拉得很长。少于 5 个时保持原来的单列。 */
+.r.wide{grid-column:1/-1}
+.acts{display:grid;gap:6px 14px;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));margin-top:6px}
+.acts .act{margin:0}
 .r{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px}
 .r b{font-size:13px}.r.on b::before{content:"● ";color:#3aa657}.r.off b::before{content:"● ";color:#c8443c}
 .r pre{margin:8px 0 0;font-size:10.5px;color:var(--dim);white-space:pre-wrap;word-break:break-all;overflow-x:auto}
@@ -326,7 +342,7 @@ td.gn b{font-size:17px}
 td.gw{width:88px;white-space:nowrap;text-align:right;color:var(--dim);font-size:12px}
 </style></head><body>
 <h1>继续教育学习进度</h1>
-<div class="sub">${t} · 每 60 秒自动刷新 · 数据现查平台接口</div>
+<div class="sub">${t} · 每 60 秒自动刷新 · 数据现查平台接口${d.tookMs != null ? ` · 取数 ${(d.tookMs / 1000).toFixed(1)}s${d.tookMs > 15000 ? '（偏慢，CDP 代理可能积压）' : ''}` : ''}</div>
 <div class="card goalcard"><h2>总目标（三平台合计）</h2>${goalHtml}</div>
 <div class="grid">
   <div class="card"><h2>浙江工信继续教育 <em>engineer.zjsjczx.org.cn</em></h2>${zjHtml}</div>
@@ -338,12 +354,27 @@ td.gw{width:88px;white-space:nowrap;text-align:right;color:var(--dim);font-size:
 }
 
 // ---------------- 服务 ----------------
-const wrap = async fn => { try { return { v: await fn() }; } catch (e) { return { err: e.message }; } };
+// 🔴 取数必须有超时，而且是**每个平台各自超时**。
+// 面板取数要走 CDP，Chrome 或代理一慢（实测代理 session 泄漏后，光列 tab 就要 13 秒），
+// 没有超时的话整个 HTTP 请求永远不返回 —— 浏览器上看就是"服务挂了"，
+// 但进程明明活着、日志也没报错，最难查的那类症状。
+// 有超时的话：慢的那个平台显示成错误，另外两个照常显示，页面永远出得来。
+const FETCH_TIMEOUT = Number(process.env.PANEL_TIMEOUT_MS || 20000);
+const wrap = async fn => {
+  try {
+    const v = await Promise.race([
+      fn(),
+      new Promise((_, rej) => setTimeout(() => rej(new Error(`取数超时（>${FETCH_TIMEOUT / 1000}s），多半是 CDP 代理或 Chrome 变慢了`)), FETCH_TIMEOUT)),
+    ]);
+    return { v };
+  } catch (e) { return { err: e.message }; }
+};
 
 const handler = async (req, res) => {
   if (req.url === '/favicon.ico') { res.writeHead(204).end(); return; }
+  const t0 = Date.now();
   const [z, h, n] = await Promise.all([wrap(zj), wrap(hz), wrap(nc)]);
-  const data = { zj: z, hz: h, nc: n, runners: runners() };
+  const data = { zj: z, hz: h, nc: n, runners: runners(), tookMs: Date.now() - t0 };
   if (req.url.startsWith('/json')) {
     res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
     res.end(JSON.stringify(data, null, 2));
