@@ -49,7 +49,7 @@
 ### 跑起来
 
 ```bash
-git clone <这个仓库>
+git clone https://github.com/justbryce/jxjy-auto.git
 cd jxjy-auto
 
 ./start.sh                  # 一条命令搞定：CDP 代理 + 三个 runner + 汇总面板
