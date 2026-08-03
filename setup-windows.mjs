@@ -87,19 +87,51 @@ const CW_WIDE = Math.max(CW, Number(process.env.WIN_WIDTH || 1100));
 // 而浙江工信的 <video> 中心在 y=355，**落在视口外**：CDP 的真实鼠标点击派发到视口外，
 // 结果点到了顶部导航栏，把页面带去了别的路由（差点被误判成"课件坏了"）。
 const WIN_TOP = 25, WIN_BOT = Number(process.env.WIN_BOTTOM || 1000);
+const WIN_H = WIN_BOT - WIN_TOP;
 // Chrome 会把顶边夹到菜单栏下沿（25 → 30），底边跟着平移。回收旧窗口时要按这组读回值匹配。
 const WIN_TOP_READBACK = 30, WIN_BOT_READBACK = WIN_BOT + (WIN_TOP_READBACK - WIN_TOP);
-const col = (i, w = CW) => [SCREEN_X0 + i * STEP, WIN_TOP, SCREEN_X0 + i * STEP + w, WIN_BOT];
+
+// 🔴 只错开 x 的层叠**不能保证可见** —— 这是 2026-08-04 踩的坑。
+// 步长 61px、窗口宽 400px 时，任何一个中间窗口都可能被「左边那个 + 右边那个」的并集完全盖住，
+// 盖不盖得住只取决于 z 序，而 z 序会被 runner 的 activate、用户点窗口随时打乱
+// （实测 10 个窗口里有 4 个建完几分钟就变 hidden，位置没动、纯粹是被前后的窗口夹死）。
+//
+// 改成**对角**层叠（x 和 y 同时递增）就和 z 序无关了，几何上可证：
+// 窗口 i 右上角那块 STEP 宽 × STEPY 高的小矩形，
+//   · 编号更大的窗口都在它**右下方**（y 更大）→ 够不着；
+//   · 编号更小的窗口右边缘 = x_i + CW - STEP < 该矩形左边 → 也够不着。
+// 所以那一小块永远露着，macOS 就不会判 occluded（遮挡判定要求**完全**覆盖）。
+// 代价是要有竖向空间：需要 (W-1)*STEPY + WIN_H。副屏是 1080×1920 竖屏，绰绰有余。
+const STEPY = Number(process.env.WIN_STEPY || 0);
+const topOf = i => WIN_TOP + i * STEPY;
+const col = (i, w = CW) => [SCREEN_X0 + i * STEP, topOf(i), SCREEN_X0 + i * STEP + w, topOf(i) + WIN_H];
+// 回收旧窗口要按**这一组**顶边认。两处坑：
+//   · 对角层叠后每个窗口顶边都不同，不能只认一个值；
+//   · **菜单栏只在主屏**，所以主屏上 y=25 被夹成 30，副屏上原样读回 25。
+//     两种都要收，否则副屏那批永远回收不掉（实测一晚上攒到 26 个窗口）。
+const TOPS_READBACK = [...new Set(
+  Array.from({ length: W }, (_, i) => topOf(i))
+    .concat([WIN_TOP])
+    .flatMap(y => [y, y + (WIN_TOP_READBACK - WIN_TOP)]))];
+if (STEPY) log(`对角层叠：x 步长 ${STEP}px，y 步长 ${STEPY}px，最低的窗口底边 ${topOf(W - 1) + WIN_H}`);
 
 // zj 是**串行**的（一次只播一门），所以给它一个正常大小的窗口，别跟着 163 一起挤成小条。
 // 摆法：zj 贴着屏幕右边先建（在 z 序底层），163 那一串再从左边层叠上去；
 // 只要最后一个 163 窗口的右边缘没盖到屏幕最右边，zj 右侧就一直露着一条 → 保持 visible。
 // （之前把 zj 塞在层叠的最后一列，它有一大半在屏幕外，页面被压成窄屏布局，
 //   左侧导航菜单直接盖在 <video> 上，合成点击点到菜单项把页面带跑 —— 排查了很久。）
-const ZJ_X = SCREEN_X0 + SCREEN_W - CW_WIDE;
+// `ZJ_X` 可以显式指定，用来把 zj 摆到**另一块屏**上。
+// 现在这台机器就是这么用的：163 那 10 个层叠小窗放副屏（不会被用户的终端/屏幕共享压住），
+// zj 单独留在主屏 —— 因为 zj 需要 1100px 宽（窄了导航菜单会压住 <video>，见上面），
+// 而副屏只有 1080 宽，塞不下。zj 播的是原生 mp4，已经在播就不吃节流，被盖住也没事。
+const ZJ_X = process.env.ZJ_X !== undefined && process.env.ZJ_X !== ''
+  ? Number(process.env.ZJ_X)
+  : SCREEN_X0 + SCREEN_W - CW_WIDE;
+const zjSameScreen = ZJ_X >= SCREEN_X0 && ZJ_X < SCREEN_X0 + SCREEN_W;
 const lastRight = SCREEN_X0 + (W - 1) * STEP + CW;
-if (lastRight >= SCREEN_X0 + SCREEN_W - 40)
+if (zjSameScreen && lastRight >= SCREEN_X0 + SCREEN_W - 40)
   log(`⚠ 最后一个 163 窗口右边缘 ${lastRight} 快贴到屏幕右边 ${SCREEN_X0 + SCREEN_W} 了，zj 可能被完全盖住`);
+if (!zjSameScreen) log(`zj 单独摆在 x=${ZJ_X}（和 163 那一串不在同一块屏）`);
 
 const PLAN = [
   { key: 'zj', file: 'zjsjczx.json', field: 'target', bounds: [ZJ_X, WIN_TOP, ZJ_X + CW_WIDE, WIN_BOT], url: 'https://engineer.zjsjczx.org.cn/zg/student/learning-center' },
@@ -132,7 +164,7 @@ try {
     'set k to 0',
     'repeat with i from (count of windows) to 1 by -1',
     '  set b to bounds of window i',
-    `  if (item 2 of b) = ${WIN_TOP_READBACK} then`,
+    `  if (item 2 of b) is in {${TOPS_READBACK.join(', ')}} then`,
     '    close window i',
     '    set k to k + 1',
     '  end if',

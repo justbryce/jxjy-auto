@@ -332,7 +332,25 @@ async function buildQueue(t, courses) {
     log(`  《${c.name}》 ${all.length} 课时，已完成 ${all.filter(x => x.st === '已完成').length}，跳过 ${skipped.length}，待学 ${todo.length}`);
     for (const ls of todo) q.push({ cid: c.id, cname: c.name, ...ls });
   }
+  // 短课时优先。163 **不认断点续播**（从断点播到尾服务端不判完成），所以一个课时必须
+  // 一口气播完才算数 —— 中途任何一次重启（自愈 / 看门狗 / 崩溃）都让这一整段白播。
+  // 于是「课时时长」直接等于「暴露在中断风险下的时间」：
+  // 2026-08-04 实测，87 分钟的《比特币：共识协议》在 11 分钟一次的重启节奏下被重开 36 次，
+  // 累计播了约 6 小时，得到 0 学时。同样这 6 小时如果都用来播 10 分钟的课时，能完成 30 多个。
+  // 排序只影响先学哪个，不跳过任何课时，长课时照样会轮到 —— 但要等系统证明自己能连续跑那么久。
+  q.sort((a, b) => secsOf(a.info) - secsOf(b.info));
   return q;
+}
+
+// "87:33" / "1:12:05" → 秒。
+// ⚠️ 解析不出时长的要排**最后**不是最前：163 里没有时长的课时几乎全是作业/考试/资料链接，
+// 根本没有 <video>，起播必然失败。排最前会让 10 个 worker 一开局全去啃这些空课时，
+// 白白把连续失败计数烧掉（2026-08-04 第一版排序就是这么翻车的）。
+const NO_DUR = 1e9;
+function secsOf(info) {
+  const m = String(info || '').match(/(\d+):(\d+)(?::(\d+))?/);
+  if (!m) return NO_DUR;
+  return m[3] ? +m[1] * 3600 + +m[2] * 60 + +m[3] : +m[1] * 60 + +m[2];
 }
 
 let reaped = false;

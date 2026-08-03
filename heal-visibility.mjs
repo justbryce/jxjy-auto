@@ -49,8 +49,36 @@ const DRY = process.argv.includes('--dry');
 // 两次自愈之间的冷却。重建窗口 + 重启 runner 有代价（丢掉最多几十秒的播放进度），
 // 而且如果是"永远修不好"的原因（比如 Chrome 整个被别的 App 全屏盖住），
 // 不设冷却就会每 5 分钟重启一次，比不修还糟。
-const COOLDOWN_MIN = Number(process.env.HEAL_COOLDOWN_MIN || 8);
+const COOLDOWN_MIN = Number(process.env.HEAL_COOLDOWN_MIN || 30);
 const STAMP = path.join(HERE, 'state', 'heal.json');
+
+// 自愈**没起作用**时的退避上限。连续几轮修完还是 hidden，说明病因不是锁屏
+// （比如用户自己的终端全屏盖住了 Chrome），再修多少次都一样，只会白白毁掉播放进度。
+const BACKOFF_MAX_MIN = Number(process.env.HEAL_BACKOFF_MAX_MIN || 240);
+// 判定"其实没被节流"的速率线。163 日志里每条进度都带「速率xx%」。
+const RATE_OK = Number(process.env.HEAL_RATE_OK || 85);
+
+// ── 真正该看的指标是「播放速率」，不是 visibilityState ──────────────────────
+// 2026-08-04 血的教训：Chrome 的密集节流只拦**起播**，**已经在播的媒体元素不吃定时器节流**。
+// 所以 tab 全 hidden 但速率 100% 是常态，此时自愈是纯亏损 —— 重启 runner 会把
+// 10 路正在播的课时全部打回 0%，而队列里 30~90 分钟的长课时根本熬不到下一次重启。
+// 实测代价：42 次自愈 / 一天，网易云从 10:29 起到凌晨 1 点**一个课时都没完成**。
+// 规则：近期速率健康就绝不动手，不管 visibilityState 是什么。
+function recentRate() {
+  try {
+    const f = path.join(HERE, 'logs', 'study163.log');
+    const buf = fs.readFileSync(f, 'utf8');
+    const lines = buf.slice(-200_000).split('\n').slice(-400);
+    const rates = [];
+    for (const l of lines) {
+      const m = l.match(/速率(\d+)%/);
+      if (m) rates.push(Number(m[1]));
+    }
+    if (rates.length < 5) return null;                 // 样本太少，说不清
+    const tail = rates.slice(-40).sort((a, b) => a - b);
+    return tail[Math.floor(tail.length / 2)];          // 中位数，抗单个异常值
+  } catch { return null; }
+}
 
 // 需要保持可见的 tab：state 文件 → 字段名
 function wantVisible() {
@@ -61,6 +89,13 @@ function wantVisible() {
   const nc = read('study163.json');
   if (nc) for (const [k, v] of Object.entries(nc)) if (/^tab\d+$/.test(k) && v) out.push({ who: `163-${k}`, tab: v });
   return out;
+}
+
+function clearStreak() {
+  try {
+    const s = JSON.parse(fs.readFileSync(STAMP, 'utf8'));
+    if (s.streak) { s.streak = 0; fs.writeFileSync(STAMP, JSON.stringify(s, null, 2)); }
+  } catch { }
 }
 
 async function main() {
@@ -75,8 +110,18 @@ async function main() {
     if (vis !== 'visible') bad.push({ ...w, vis });
   }
 
-  if (!bad.length) { log(`${want.length} 个专用 tab 都是 visible，无需处理`); return; }
+  if (!bad.length) { log(`${want.length} 个专用 tab 都是 visible，无需处理`); clearStreak(); return; }
   log(`⚠ ${bad.length}/${want.length} 个专用 tab 丢了可见性：` + bad.map(b => `${b.who}=${b.vis}`).join(' '));
+
+  // hidden 本身不是伤害，掉速才是。先看真实速率再决定动不动手。
+  const rate = recentRate();
+  const gone = bad.filter(b => b.vis === 'tab 没了').length;
+  if (rate != null && rate >= RATE_OK && gone === 0) {
+    log(`  但近期播放速率中位数 ${rate}%（≥${RATE_OK}%）—— hidden 没造成掉速，本轮不动手。`);
+    log('     已经在播的媒体元素不吃定时器节流；此时重启 runner 只会把在播的课时全打回 0%。');
+    return;
+  }
+  if (rate != null) log(`  近期播放速率中位数 ${rate}%${gone ? `，另有 ${gone} 个 tab 没了` : ''} —— 确实在掉速`);
 
   // 🔴 **显示器睡着的时候绝对不能自愈。**
   // 自愈的原理是"新建的窗口是 visible 的"，但那只在**屏幕锁了、显示器还亮着**时成立。
@@ -98,10 +143,19 @@ async function main() {
 
   let stamp = {};
   try { stamp = JSON.parse(fs.readFileSync(STAMP, 'utf8')); } catch { }
+  // 上一轮修完症状又回来了 → 说明这个病因自愈治不了，指数退避。
+  // （最典型的：用户自己的终端/别的 App 全屏盖住整个主屏，重建多少次窗口都会再被盖回去。）
+  const streak = Number(stamp.streak || 0);
+  const cool = Math.min(COOLDOWN_MIN * 2 ** streak, BACKOFF_MAX_MIN);
   const sinceMin = stamp.at ? (Date.now() - stamp.at) / 60000 : Infinity;
-  if (sinceMin < COOLDOWN_MIN) {
-    log(`  ${sinceMin.toFixed(0)} 分钟前刚自愈过（冷却 ${COOLDOWN_MIN} 分钟），这次跳过`);
+  if (sinceMin < cool) {
+    log(`  ${sinceMin.toFixed(0)} 分钟前刚自愈过（冷却 ${cool} 分钟${streak ? `，已连续 ${streak} 次没治好 → 退避中` : ''}），这次跳过`);
     return;
+  }
+  if (streak >= 3) {
+    log(`  ⚠ 连续 ${streak} 次自愈都没能让症状消失 —— 病因基本不是锁屏。`);
+    log('     最可能：Chrome 被别的 App（终端 / 全屏窗口）整个盖住。这种情况重建窗口治不好，');
+    log('     但好消息是**已经在播的视频不掉速**，真正的损失只有"新课时起播难"。');
   }
   if (DRY) { log('  --dry，只报告不动手'); return; }
 
@@ -118,8 +172,8 @@ async function main() {
   try { run('bash', ['start.sh']).trim().split('\n').filter(l => /✅|❌/.test(l)).forEach(l => log('  | ' + l)); }
   catch (e) { log('  ❌ start.sh 失败：', e.message); return; }
 
-  fs.writeFileSync(STAMP, JSON.stringify({ at: Date.now(), fixed: bad.map(b => b.who) }, null, 2));
-  log('✅ 自愈完成');
+  fs.writeFileSync(STAMP, JSON.stringify({ at: Date.now(), fixed: bad.map(b => b.who), streak: streak + 1 }, null, 2));
+  log(`✅ 自愈完成（若下轮症状消失，streak 会清零；否则冷却翻倍到 ${Math.min(cool * 2, BACKOFF_MAX_MIN)} 分钟）`);
 }
 
 // 🔒 单实例锁。两个守护同时跑会**互相打架**：各自建一整套窗口，彼此覆盖，

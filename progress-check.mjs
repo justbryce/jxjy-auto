@@ -54,11 +54,19 @@ async function snapshot() {
   return out;
 }
 
-// hz 的 credited 只有点了「学时重算」才涨，所以它单独看"已学完门数"这个实时指标
+// 第三列 = 这个指标"多久没涨才算不正常"，单位分钟。**不同指标的更新节奏差一个数量级，
+// 不能共用一个窗口**。
+//
+// 🔴 新干线原来看的是 `data.course.length`（已学完门数）—— 那是个**死指标**：
+// 平台把这个列表截断到 8 条，学完再多也永远返回 8。结果它从 2026-08-03 中午一直报警到凌晨，
+// 报了 20 多条，而同期新干线的学时其实从 16 涨到了 49。
+// 假警报比没有警报更糟：它把真出事时的那一条淹掉了。
+// 现在改看 `data.study` 里「总学时」的 s（权威值），代价是它只在「学时重算」之后才跳
+// （recalc.sh 每天 8:05 / 20:05 各跑一次，平台限 3 次/天），所以窗口给到 12 小时。
 const METRICS = [
-  ['zj', '浙江工信学时'],
-  ['hzDone', '新干线已学完门数'],
-  ['nc', '网易云已完成课时'],
+  ['zj', '浙江工信学时', STALE_MIN],
+  ['hz', '新干线总学时', 12 * 60],
+  ['nc', '网易云已完成课时', STALE_MIN],
 ];
 
 const now = Date.now();
@@ -71,19 +79,22 @@ fs.writeFileSync(SNAP, JSON.stringify(hist, null, 1));
 
 log(METRICS.map(([k, n]) => `${n}=${cur[k] ?? '?'}`).join(' | '));
 
-const old = hist.find(x => now - x.t >= STALE_MIN * 60_000);
-if (!old) { log(`（历史不足 ${STALE_MIN} 分钟，先攒数据）`); process.exit(0); }
-
-const stalled = METRICS.filter(([k]) =>
-  cur[k] != null && old[k] != null && cur[k] <= old[k]);
+// 每个指标按自己的窗口回看
+const stalled = METRICS.filter(([k, , win]) => {
+  const old = hist.find(x => now - x.t >= win * 60_000);
+  return old && cur[k] != null && old[k] != null && cur[k] <= old[k];
+});
+if (!hist.find(x => now - x.t >= STALE_MIN * 60_000)) {
+  log(`（历史不足 ${STALE_MIN} 分钟，先攒数据）`); process.exit(0);
+}
 
 if (stalled.length === METRICS.length) {
-  const msg = `三个平台 ${STALE_MIN} 分钟内产出都没涨，多半是空转了`;
+  const msg = `三个平台产出都没涨，多半是空转了`;
   log('🚨', msg);
   fs.appendFileSync(path.join(HERE, 'logs/ALERT.log'), `${new Date().toLocaleString('zh-CN')} 🚨 ${msg}\n`);
   try { execSync(`osascript -e 'display notification "${msg}" with title "继续教育自动学习"'`); } catch { }
 } else if (stalled.length) {
-  const msg = stalled.map(([, n]) => n).join('、') + ` ${STALE_MIN} 分钟没涨`;
+  const msg = stalled.map(([, n, w]) => `${n} ${w >= 60 ? (w / 60) + ' 小时' : w + ' 分钟'}没涨`).join('、');
   log('⚠', msg);
   fs.appendFileSync(path.join(HERE, 'logs/ALERT.log'), `${new Date().toLocaleString('zh-CN')} ⚠ ${msg}\n`);
 } else {
