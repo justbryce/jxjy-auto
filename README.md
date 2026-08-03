@@ -105,25 +105,33 @@ echo 'export NC_CONCURRENCY=2' >> env.local
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `CDP_PROXY` | `http://localhost:3456` | CDP 代理地址 |
-| `NC_CONCURRENCY` | `3` | 网易云课堂并行 worker 数。**改了要重跑 `NC_CONCURRENCY=<n> node setup-windows.mjs`** |
+| `NC_CONCURRENCY` | `3` | 网易云课堂并行 worker 数。**改了要重跑 `node setup-windows.mjs` 并重启 runner**。实测 10 路仍是满速（见坑 6）|
 | `HZ_PLAY_VIDEO` | `0` | 新干线要不要真的播视频。它的学时按页面墙钟计，播视频对学时零收益却抢带宽，所以默认关 |
 | `NC_VOLUME` | `0` | 网易云播放音量。**只能是 0 或很小的值**，且绝不能改成 `muted=true`（见坑 2） |
 | `EXPOSE` | 空 | 面板监听范围。默认只绑 `127.0.0.1`；`lan` = 额外绑内网地址（手机能看，**但无鉴权**）；也可填具体 IP |
 | `PORT` | `8848` / `3456` | 面板端口 / CDP 代理端口（两个程序各自读，别搞混） |
 | `CHROME_PORT` | `9222` | Chrome 远程调试端口（`tools/cdp-proxy.mjs` 用，会自动探测 9222/9229/9333） |
-| `SCREEN_W` | 自动探测 | 屏幕宽度，`setup-windows.mjs` 用来排布窗口 |
+| `SCREEN_W` | 读 system_profiler | 桌面总宽度，`setup-windows.mjs` 用来排布窗口 |
+| `SCREEN_X0` | `0` | 桌面最左边界。副屏在左边时是负数（如 `-1920`）|
+| `OSA_TIMEOUT_MS` | `90000` | osascript 超时。并发高时 Chrome 建窗口会变慢，别调小 |
+| `HEAL_COOLDOWN_MIN` | `8` | 两次可见性自愈之间的冷却 |
 | `STALE_MIN` | `90` | 产出多少分钟没涨就告警 |
 
 学习顺序、学科门类优先级这些，直接改 `runners/*.mjs` 顶部的常量：
 
 ```js
 // runners/hzrs.mjs
-const TYPE_ORDER = [15, 16, 17];                                 // 专业课程 → 行业公需 → 一般公需
-const SYSTEM_PRIORITY = { '工学': 0, '理学': 1, '经济学': 2 };      // 专业课程里优先哪个门类
+const FIELD_ID = process.env.HZ_FIELD_ID ?? '9';   // 专业领域：9=工业和信息化领域系列
 ```
 
-新干线**先学哪一类不用配**：runner 每轮读平台后台给的年度要求（`data.study` 里每类的
-`r`=要求 / `s`=已得），谁还差就先补谁，硬性要求都满了再拿没有下限的类别去填总学时。
+新干线**先学哪一类、学哪个方向，都不用手配**：
+- 方向：`SelectCourse` 返回的课程池**服务端已经按账号申报的专业领域过滤过了**，
+  客户端不需要再按学科门类筛（按「工学」筛反而会误杀同样合格的经济学/理学课）。
+  `FIELD_ID` 只是选课前的一道断言，方向不对就跳过并告警。
+- 顺序：runner 每轮问汇总面板要**跨平台缺口**（三个平台加起来还差多少专业/公需），
+  谁缺补谁；问不到就退回本站自己的年度要求。
+
+跨平台总目标用 `GOAL_SPEC`（默认 180）和 `GOAL_GX`（默认 90）配。
 
 ---
 
