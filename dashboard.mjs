@@ -66,12 +66,25 @@ async function nc() {
       const L=(j.result&&j.result.list)||[];
       out.push(...L.map(x=>({id:String(x.courseId),name:x.name,units:x.units,fin:x.finishedUnits})));
       if(p>=((j.result&&j.result.query&&j.result.query.totlePageCount)||1))break;}
-    return JSON.stringify({list:out})})()`);
+    // 🔑 网易云**是有官方学时的**，只是藏得深：个人主页「生成学习登记卡」按钮背后的接口。
+    //    这是唯一权威的折算结果（平台按已看视频时长自己算，约 1 学时 ≈ 60 分钟）。
+    //    没学过的课不会出现在里面；学时不足 0.1 的也会被略去。
+    //    ⚠️ 和 courseListV2 一样，**必须带 edu-script-token 头**（值=cookie NTESSTUDYSI），
+    //       不带就是 403 + 空 body（页面自己点按钮时带了，手工 fetch 忘了带会以为接口坏了）。
+    let card=[];
+    try{const c=await (await fetch("/j/my/learnCard/listCourses.json?year="+new Date().getFullYear()+"&t="+Date.now(),
+        {headers:{"edu-script-token":tk},credentials:"include"})).json();
+        card=(c&&c.result)||[]}catch(e){}
+    return JSON.stringify({list:out,card:card.map(x=>({id:String(x.courseId),n:x.courseName,h:Number(x.period)||0}))})})()`);
   if (api?.err) throw new Error(String(api.err).includes('登录') ? api.err : '接口 ' + api.err);
   let watched = {};
   try { watched = JSON.parse(fs.readFileSync(path.join(HERE, 'state/study163.json'), 'utf8')).watched || {}; } catch { }
   const secs = Object.values(watched).reduce((a, b) => a + (b.s || 0), 0);
-  return { list: api.list, watchedSecs: secs, watchedN: Object.keys(watched).length };
+  const card = api.card || [];
+  return {
+    list: api.list, card, hours: card.reduce((a, b) => a + b.h, 0),
+    watchedSecs: secs, watchedN: Object.keys(watched).length,
+  };
 }
 
 // 把日志尾巴翻译成人话：现在在学哪门、进度多少、速率正不正常。
@@ -142,9 +155,48 @@ function bar(done, need, color) {
   return `<div class="bar"><i style="width:${pct.toFixed(1)}%;background:${color}"></i></div>`;
 }
 
+// 🎯 真正的目标是**三个平台加起来**达标，不是每个平台各自达标。
+//    默认值按「副高·工业与信息化」：总 270 = 专业课程 180 + 公需 90（行业+一般都算）。
+//    换成你自己的要求：GOAL_SPEC / GOAL_GX 两个环境变量。
+const GOAL_SPEC = Number(process.env.GOAL_SPEC || 180);
+const GOAL_GX = Number(process.env.GOAL_GX || 90);
+
+// 每个平台的学时算「专业」还是「公需」，是各平台自己的口径，写死在这里：
+//   · 浙江工信  —— 一般公需 + 行业公需，全算公需（该账号专业科目 0 门）
+//   · 新干线    —— 平台自己就分了专业课程 / 行业公需 / 一般公需
+//   · 网易云    —— 官方「学习登记卡」给的学时，算专业课（内容是计算机/信息/工业方向）
+function goals(d) {
+  const g = { spec: [], gx: [] };
+  if (!d.zj.err) g.gx.push({ from: '浙江工信', h: (d.zj.v.gen || 0) + (d.zj.v.ind || 0) });
+  if (!d.hz.err) {
+    const q = t => d.hz.v.req.find(x => x.t === t)?.done || 0;
+    g.spec.push({ from: '新干线', h: q('专业课程') });
+    g.gx.push({ from: '新干线', h: q('行业公需') + q('一般公需') });
+  }
+  if (!d.nc.err) g.spec.push({ from: '网易云', h: d.nc.v.hours || 0 });
+  const sum = a => a.reduce((x, y) => x + y.h, 0);
+  return { ...g, specSum: sum(g.spec), gxSum: sum(g.gx) };
+}
+
 function render(d) {
   const t = new Date().toLocaleString('zh-CN');
   const TN = { 1: '专业科目', 2: '一般公需', 3: '行业公需' };
+
+  const G = goals(d);
+  const goalRow = (label, got, need, parts, color) => `<tr>
+    <td class="gl">${label}</td>
+    <td class="gn"><b>${got.toFixed(1)}</b> / ${need}</td>
+    <td style="width:45%">${bar(got, need, color)}</td>
+    <td class="dim">${parts.filter(p => p.h > 0).map(p => `${p.from} ${p.h.toFixed(1)}`).join(' ＋ ') || '—'}</td>
+    <td class="gw">${got >= need ? '✅ 已达标' : `还差 ${(need - got).toFixed(1)}`}</td></tr>`;
+  const goalHtml = `<table class="goal">
+    ${goalRow('专业课程', G.specSum, GOAL_SPEC, G.spec, '#4c8bf5')}
+    ${goalRow('公需课程', G.gxSum, GOAL_GX, G.gx, '#e0762a')}
+    ${goalRow('合计', G.specSum + G.gxSum, GOAL_SPEC + GOAL_GX, [], '#3aa657')}
+  </table>
+  <p class="note">口径：三个平台**加起来**达标即可。浙江工信全部算公需；新干线按平台自己的分类；
+  网易云取官方「学习登记卡」（个人主页那个按钮）给的学时，算专业课。
+  下面三张卡片是各平台自己的进度和年度要求，和上面这个总目标是两回事。</p>`;
 
   let zjHtml;
   if (d.zj.err) zjHtml = `<p class="err">${esc(d.zj.err)}</p>`;
@@ -184,11 +236,18 @@ function render(d) {
     const units = n.list.reduce((a, b) => a + b.units, 0), fin = n.list.reduce((a, b) => a + b.fin, 0);
     const rows = n.list.map(c => `<tr><td>${esc(c.name)}</td><td>${c.fin}/${c.units} 课时</td>
       <td>${bar(c.fin, c.units, '#c8443c')}</td></tr>`).join('');
-    ncHtml = `<div class="kpi"><b>${fin}/${units}</b><span>课时（本机记账已看完 ${n.watchedN} 个课时 / ${hrs(n.watchedSecs)} 小时视频）</span></div>
+    const cardRows = (n.card || []).map(c => `<tr><td>${esc(c.n)}</td><td>${c.h.toFixed(1)} 学时</td></tr>`).join('');
+    ncHtml = `<div class="kpi"><b>${(n.hours || 0).toFixed(1)}</b><span>官方学时（学习登记卡）· ${fin}/${units} 课时 · 本机记账 ${hrs(n.watchedSecs)} 小时视频</span></div>
       <table>${rows}</table>
-      <p class="note">网易云课堂<b>没有"学时"这个概念</b>，也没有任何官方学时统计页。这里给两个都能核对的真实口径：<br>
-      ① 课时完成数 —— 平台接口 <code>/j/my/courseListV2.json</code> 的 <code>finishedUnits/units</code>，可在「我的学习」页面肉眼核对；<br>
-      ② 视频时长 —— 本机记录每个播完的课时的实际 <code>video.duration</code> 累加，不含重播。</p>`;
+      <h4>官方学时明细</h4>
+      <table>${cardRows || '<tr><td class="dim">（还没有课产生学时）</td></tr>'}</table>
+      <p class="note">✅ 网易云<b>是有官方学时的</b>，只是藏得深：个人主页
+      <code>study.163.com/user/&lt;uid&gt;.htm</code> 点「生成学习登记卡」，
+      背后接口是 <code>/j/my/learnCard/listCourses.json?year=YYYY</code> 的 <code>period</code> 字段。<br>
+      实测折算约 <b>1 学时 ≈ 60 分钟已看视频</b>（按视频时长算，不是按课时数 ——
+      课时长短差 20 倍，按课时数估会离谱地失真）。没学过的课不出现在登记卡里。<br>
+      另外两个可交叉核对的口径：课时完成数 <code>finishedUnits/units</code>（「我的学习」页面肉眼可查）、
+      本机累加的实际 <code>video.duration</code>（不含重播）。</p>`;
   }
 
   const rs = d.runners.map(r => {
@@ -257,9 +316,18 @@ ul.cur li{margin:3px 0}
 .bad .ts{color:var(--dim);font-variant-numeric:tabular-nums;margin-right:4px}
 details{margin-top:10px}
 summary{font-size:11px;color:var(--dim);cursor:pointer}
+.goalcard{margin-bottom:18px}
+table.goal{width:100%;border-collapse:collapse}
+table.goal td{padding:9px 8px;border-bottom:1px solid var(--line);vertical-align:middle;font-size:13px}
+table.goal tr:last-child td{border-bottom:none;font-weight:600}
+td.gl{width:70px;white-space:nowrap}
+td.gn{width:96px;white-space:nowrap;font-variant-numeric:tabular-nums}
+td.gn b{font-size:17px}
+td.gw{width:88px;white-space:nowrap;text-align:right;color:var(--dim);font-size:12px}
 </style></head><body>
 <h1>继续教育学习进度</h1>
 <div class="sub">${t} · 每 60 秒自动刷新 · 数据现查平台接口</div>
+<div class="card goalcard"><h2>总目标（三平台合计）</h2>${goalHtml}</div>
 <div class="grid">
   <div class="card"><h2>浙江工信继续教育 <em>engineer.zjsjczx.org.cn</em></h2>${zjHtml}</div>
   <div class="card"><h2>杭州学习新干线 <em>learning.hzrs.hangzhou.gov.cn</em></h2>${hzHtml}</div>

@@ -52,6 +52,17 @@ else
   echo "· dashboard 已在运行 → http://localhost:8848"
 fi
 
+# 可见性自愈守护进程。**必须由这里拉起，不能交给 cron** ——
+# 它要用 osascript 建窗口，而 macOS 的 Apple Events 授权按"责任进程"给，
+# cron/launchd 起的进程会卡在一个没人看得见的授权弹窗上直到超时。
+# 详见 heal-visibility.mjs 顶部注释。
+if ! pgrep -f "heal-visibility.mjs --daemon" >/dev/null; then
+  nohup node heal-visibility.mjs --daemon >> logs/heal.log 2>&1 &
+  echo "✅ 可见性自愈守护 已启动"
+else
+  echo "· 可见性自愈守护 已在运行"
+fi
+
 SITES=("$@")
 [ ${#SITES[@]} -eq 0 ] && SITES=(zjsjczx hzrs study163)
 for s in "${SITES[@]}"; do start "$s"; done

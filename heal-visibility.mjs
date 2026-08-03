@@ -21,7 +21,17 @@
 // 只有真的掉了可见性（锁屏 / 窗口被别的全屏窗口盖住）才会动手，而那种情况下
 // 不动手的后果就是**默默地慢 3 倍**。所以默认开启，不做成开关。
 //
-// 用法：node heal-visibility.mjs [--dry]     （watchdog.sh 每 5 分钟调一次）
+// ── ⚠️ 为什么要常驻，而不是让 cron 每 5 分钟跑一次 ────────────────────────
+// 自愈要靠 `osascript` 建窗口，而 macOS 的 Apple Events 授权是**按"责任进程"**给的。
+// 从 cron / launchd 里跑，责任进程不是你交互式授权过的那个终端 →
+// `osascript` 会**卡住等一个没人看得见的授权弹窗**，最后超时（实测：SIGTERM，15s）。
+// 所以本脚本要以 `--daemon` 常驻，由 `start.sh`（你手动跑的、已授权的上下文）拉起，
+// cron 里的 watchdog 只负责检查它还活着。
+//
+// 用法：
+//   node heal-visibility.mjs           跑一次
+//   node heal-visibility.mjs --dry     只报告不动手
+//   node heal-visibility.mjs --daemon  常驻，每 HEAL_INTERVAL_SEC（默认 300）秒查一次
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -91,4 +101,14 @@ async function main() {
   log('✅ 自愈完成');
 }
 
-main().catch(e => { log('💥', e.message); process.exit(1); });
+if (process.argv.includes('--daemon')) {
+  const every = Number(process.env.HEAL_INTERVAL_SEC || 300) * 1000;
+  log(`常驻模式启动，每 ${every / 1000}s 检查一次`);
+  // 单次异常不能把守护进程带走 —— 它挂了就没人修可见性了，而那种失败是"静默变慢"，最难发现。
+  for (; ;) {
+    await main().catch(e => log('💥 本轮异常，继续:', e.message));
+    await new Promise(r => setTimeout(r, every));
+  }
+} else {
+  main().catch(e => { log('💥', e.message); process.exit(1); });
+}

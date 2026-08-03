@@ -53,6 +53,16 @@ const osa = (...lines) => execFileSync('osascript',
 
 const allIds = async () => new Set((await cdp.findTabs(() => true)).map(t => t.targetId));
 
+// 先把上一轮建的专用 tab 关掉。不关的话每跑一次就多 4 个窗口 ——
+// 锁屏自愈（heal-visibility.mjs）会反复调本脚本，实测几轮下来能攒到十几个窗口，
+// 既占内存，又让"主窗口抬回最前"这一步越来越不准。
+for (const p of PLAN) {
+  const f = path.join(HERE, 'state', p.file);
+  let d = {}; try { d = JSON.parse(fs.readFileSync(f, 'utf8')); } catch { }
+  const old = d[p.field];
+  if (old && await cdp.tabAlive(old)) { await cdp.closeTab(old).catch(() => { }); log(`回收旧 tab ${p.key} ${String(old).slice(0, 8)}`); }
+}
+
 for (const p of PLAN) {
   // ⚠️ 必须用"建窗口前后的 targetId 差集"来认新 tab。按 URL 找会命中主窗口里早就存在的同址老 tab
   //    （比如 study.163.com/my 那种），结果把老 tab 当成新窗口的 tab 写进 state，白忙一场。

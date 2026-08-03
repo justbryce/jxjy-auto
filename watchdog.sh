@@ -47,11 +47,14 @@ for s in zjsjczx hzrs study163; do
   fi
 done
 
-# 可见性自愈：专用窗口里的 tab 变成 hidden 就重建窗口 + 重启 runner。
-# 最常见的触发原因是机器锁屏（macOS 锁屏时把当时存在的窗口全标成 occluded 且不再重算），
-# 而**锁屏后新建的窗口是 visible 的**，所以重建一次就能恢复满速。详见 heal-visibility.mjs 顶部注释。
-# 本机屏幕解锁时这条是 no-op，不会有任何副作用。
-node heal-visibility.mjs >> "$WLOG" 2>&1
+# 可见性自愈守护进程：只检查它活着，**不要在这里直接跑自愈**。
+# 自愈要用 osascript 建窗口，而 Apple Events 授权是按"责任进程"给的 ——
+# 从 cron 里跑，osascript 会卡在一个没人看得见的授权弹窗上直到超时（实测 SIGTERM）。
+# 所以自愈只能由 start.sh（人手动跑的、已授权的上下文）拉起的常驻进程来做。
+if ! pgrep -f "heal-visibility.mjs --daemon" >/dev/null; then
+  echo "$(ts) ⚠️ 可见性自愈守护不在运行 —— 需要在已授权的终端里执行 ./start.sh 把它拉起来" >> logs/ALERT.log
+  osascript -e 'display notification "可见性自愈守护挂了，请在终端跑 ./start.sh" with title "继续教育自动学习"' 2>/dev/null
+fi
 
 # 汇总面板
 if ! pgrep -f "node dashboard.mjs" >/dev/null; then

@@ -132,7 +132,16 @@ async function playCourse(target, c) {
     log('  启动重试', i + 1, JSON.stringify(k));
     await sleep(5000);
   }
-  if (!started) { log('  启动失败，跳过'); return 'retry'; }
+  if (!started) {
+    // 🔴 有的课件视频源本身是坏的（`NotSupportedError`：Chrome 认不了这个源，重试多少次都没用）。
+    //    只 return 'retry' 而不落盘，上层下一轮会**按同样的排序规则又选中它** → 4 分钟一圈死循环。
+    //    （2026-08-03 踩到：id=166《网络舆情监测的核心要素与工作机制》这么空转了半小时。）
+    //    所以要持久化跳过，别让它再被选中。
+    (state.data.skip ||= []).push(String(c.id));
+    state.save();
+    log(`  启动失败（起播 5 次都没成，多半是课件源坏了），拉黑 id=${c.id} 不再选`);
+    return 'retry';
+  }
 
   let last = -1, stall = 0, lastPct = -1, pollErr = 0;
   const t0 = Date.now(), budget = (c.len + 1200) * 1000;
@@ -207,10 +216,11 @@ async function loop() {
     log(`学时：一般公需 ${h.gen} + 行业公需 ${h.ind} = ${h.sum}`);
 
     let pick = null;
+    const skip = new Set(state.data.skip || []);   // 起播失败过的坏课件，别再选
     for (const type of [3, 1, 2]) {           // 行业公需 → 专业科目 → 一般公需
       const list = await getCourses(target, type);
       if (!list) continue;
-      const todo = list.filter(x => x.p < 1);
+      const todo = list.filter(x => x.p < 1 && !skip.has(String(x.id)));
       if (!todo.length) continue;
       // 按「还要看多久换 1 学时」排序，最省时间的先看
       todo.sort((a, b) => (a.len - Math.min(a.lt, a.len)) / (a.ct || 0.5) - (b.len - Math.min(b.lt, b.len)) / (b.ct || 0.5));

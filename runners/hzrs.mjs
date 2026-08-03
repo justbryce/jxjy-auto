@@ -32,8 +32,18 @@ const state = cdp.makeState(path.join(HERE, '../state/hzrs.json'));
 // 课程类别 typeid：15 专业课程 / 16 行业公需 / 17 一般公需
 const TYPE_ORDER = [15, 16, 17];
 const TYPE_NAME = { 15: '专业课程', 16: '行业公需', 17: '一般公需' };
-// 专业课程里优先哪个学科门类，按自己的专业领域改（这里是工学=工信领域）
-const SYSTEM_PRIORITY = { '工学': 0, '理学': 1, '经济学': 2 };
+
+// 🔑「专业方向」的权威字段是 professional_field_id（专业领域/行业系列），
+//    **不是** min_catelogname（学科门类，列表卡片上那个 [工学] 角标）—— 两者完全正交。
+//    9 = 工业和信息化领域系列。改成你自己申报的方向，或设成空串关掉校验。
+//
+//    重要：`SelectCourse` 返回的课程池**服务端已经按账号申报的专业领域过滤过了**
+//    （实测 type=15 的 341 门 100% 含 id=9；反例：一门 min_catelogname=工学 但
+//     professional_field_id=6 的课在接口里根本搜不到）。所以**不要**在客户端按学科门类筛 ——
+//    按「工学」筛会误杀 38 门合法的 经济学/理学 课（全是信息化规划解读、数字经济那类）。
+//    这里保留的是一道**断言**：选课前查一次详情，方向不对就跳过并告警。
+//    它只在"账号申报信息被改"或"平台改了过滤逻辑"时才会响，平时零影响。
+const FIELD_ID = process.env.HZ_FIELD_ID ?? '9';
 
 async function post(target, url, body) {
   return evalJson(target, `(async()=>{const r=await fetch(${JSON.stringify(url)},{method:"POST",
@@ -100,6 +110,16 @@ async function finished(ctl) {
 async function chooseCourse(ctl, ids) {
   const r = await post(ctl, '/api/index/Course/chooseCourse', { courseid: ids });
   return r?.status === 200;
+}
+
+// 唯一权威的「专业方向」判据。只有课程详情接口才返回，列表接口里没有。
+// 返回 true=方向对得上 / false=对不上（该跳过）/ null=查不到（放行，别因为接口抖动就停摆）
+async function fieldOk(ctl, courseid) {
+  if (!FIELD_ID) return null;
+  const j = await post(ctl, '/api/index/index/getCourseInfo', { courseid }).catch(() => null);
+  const v = j?.data?.professional_field_id;
+  if (v == null || v === '') return null;
+  return String(v).split(',').map(s => s.trim()).includes(FIELD_ID);
 }
 
 // ---- 别人在学吗 ----
@@ -316,12 +336,23 @@ async function loop() {
 
       const list = (await catalog(ctl, type)).filter(x => !doneSet.has(x.id) && x.secs > 0 && x.h > 0);
       if (!list.length) continue;
-      list.sort((a, b) =>
-        (SYSTEM_PRIORITY[a.sys] ?? 9) - (SYSTEM_PRIORITY[b.sys] ?? 9) ||   // 工学优先
-        a.secs / a.h - b.secs / b.h);                                      // 再按每学时耗时最短
-      const cand = list[0];
+      // 唯一的排序目标：**每学时花的墙钟时间最短**。
+      // 别再按学科门类（工学/经济学/理学）排 —— 那个维度和专业方向无关，
+      // 服务端已经按账号申报的方向过滤过了，按门类排只会把同样合格的课排到后面。
+      list.sort((a, b) => a.secs / a.h - b.secs / b.h);
+      let cand = null;
+      for (const c of list.slice(0, 20)) {           // 方向不对的极少，最多往下试 20 门
+        const ok = type === 15 ? await fieldOk(ctl, c.id) : null;
+        if (ok === false) {
+          log(`  ⚠ 《${c.name}》 专业领域对不上（要 ${FIELD_ID}），跳过并拉黑`);
+          (state.data.blacklist ||= []).push(c.id); state.save();
+          continue;
+        }
+        cand = c; break;
+      }
+      if (!cand) { log('  连着 20 门方向都对不上，2 分钟后重试'); await sleep(120_000); break; }
       if (!await chooseCourse(ctl, [cand.id])) { log('选课失败', cand.id); await sleep(60_000); break; }
-      log(`＋ 选课《${cand.name}》 ${cand.h}学时 [${cand.sys}/${cand.cat}]（${TYPE_NAME[type]}还剩 ${list.length} 门）`);
+      log(`＋ 选课《${cand.name}》 ${cand.h}学时 ${(cand.secs / cand.h / 60).toFixed(0)}分钟/学时 [${cand.sys}/${cand.cat}]（${TYPE_NAME[type]}还剩 ${list.length} 门）`);
       pick = { id: cand.id, name: cand.name, secs: cand.secs, h: cand.h, type: TYPE_NAME[type] };
       already = 0;
       break;
