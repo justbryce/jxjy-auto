@@ -70,6 +70,17 @@ async function myCourses(t) {
     return JSON.stringify({list:out})})()`);
 }
 
+// 把本项目所有 163 tab 里的视频停掉。会话失效时必须调 ——
+// 否则 runner 已经停了，视频还在各自的 tab 里自顾自播，纯烧带宽且一秒都不计数。
+async function pauseAll() {
+  for (const k of Object.keys(state.data)) {
+    if (!/^tab\d+$/.test(k)) continue;
+    await evalJs(state.data[k], `(()=>{const v=document.querySelector("video");if(v)v.pause();return 1})()`)
+      .catch(() => { });
+  }
+  log('  已暂停所有 tab 的视频');
+}
+
 // ---------- worker ----------
 async function ensureTab(w) {
   const key = `tab${w}`;
@@ -277,6 +288,8 @@ async function loop() {
   const t0 = await ensureTab(0);
   const res = await myCourses(t0);
   if (res?.notAuth) {
+    await pauseAll();          // 别让视频继续空转烧带宽 —— 这时候播多少都不算数
+
     log('❌ 登录态失效（接口返回 not_auth）—— 视频还能播但一秒都不会被记录，先停下来。请在 Chrome 里重新登录 study.163.com，10 分钟后自动重试');
     await sleep(600_000);
     return;
@@ -300,6 +313,7 @@ async function loop() {
       if (!task) return;
       if (!await sessionAlive(t)) {
         log(`w${w} ❌ 登录态失效，停止本轮（请重新登录 study.163.com）`);
+        await pauseAll();
         return;
       }
       try {

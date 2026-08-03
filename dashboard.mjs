@@ -67,7 +67,7 @@ async function nc() {
       out.push(...L.map(x=>({id:String(x.courseId),name:x.name,units:x.units,fin:x.finishedUnits})));
       if(p>=((j.result&&j.result.query&&j.result.query.totlePageCount)||1))break;}
     return JSON.stringify({list:out})})()`);
-  if (api?.err) throw new Error('接口 ' + api.err + '（登录态？）');
+  if (api?.err) throw new Error(String(api.err).includes('登录') ? api.err : '接口 ' + api.err);
   let watched = {};
   try { watched = JSON.parse(fs.readFileSync(path.join(HERE, 'state/study163.json'), 'utf8')).watched || {}; } catch { }
   const secs = Object.values(watched).reduce((a, b) => a + (b.s || 0), 0);
