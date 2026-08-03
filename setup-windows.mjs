@@ -23,6 +23,15 @@ import { sleep } from './lib/cdp.mjs';
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const log = cdp.makeLogger('windows');
 
+// ⚠️ 自己读一遍 env.local。start.sh 会 source 它，但**本脚本经常被直接调用**
+//    （手动跑、或者被 heal-visibility.mjs 调用），那时候 NC_CONCURRENCY 就丢了 →
+//    窗口数按默认 3 建，而 runner 按 env.local 的 6 起 → 多出来的 worker 没有可见窗口，
+//    默默地只跑 30% 速率。踩过一次。
+for (const line of (() => { try { return fs.readFileSync(path.join(HERE, 'env.local'), 'utf8').split('\n'); } catch { return []; } })()) {
+  const m = line.match(/^\s*(?:export\s+)?([A-Z_][A-Z0-9_]*)\s*=\s*(.*?)\s*$/);
+  if (m && process.env[m[1]] === undefined) process.env[m[1]] = m[2].replace(/^["']|["']$/g, '');
+}
+
 const W = Number(process.env.NC_CONCURRENCY || 3);      // 163 要几个 worker 就开几个窗口
 
 // 可用桌面范围。注意 `Finder` 的 desktop bounds **只给主屏**，看不出有没有第二块屏；
@@ -32,7 +41,7 @@ const W = Number(process.env.NC_CONCURRENCY || 3);      // 163 要几个 worker 
 // 多屏：副屏在**左边**时坐标是负的，用 SCREEN_X0 指定最左边界（如 -1920）；
 // 在右边就只需要把 SCREEN_W 调大。两个都能用环境变量直接覆盖，跳过自动探测。
 const osaProbe = (...lines) => execFileSync('osascript',
-  lines.flatMap(l => ['-e', l]), { encoding: 'utf8', timeout: 15000 }).trim();
+  lines.flatMap(l => ['-e', l]), { encoding: 'utf8', timeout: 90000 }).trim();
 let SCREEN_X0 = Number(process.env.SCREEN_X0 || 0);
 let SCREEN_W = Number(process.env.SCREEN_W || 0);
 if (!SCREEN_W) {
@@ -78,8 +87,12 @@ const PLAN = [
 ];
 
 // 多行 AppleScript 用 -e 逐行传，别塞进一个字符串（osascript 会报语法错）
+// ⚠️ 超时给足。原来给 15s，在「6 路视频正在播」的时候 Chrome 建一个窗口就能超 ——
+//    表现是 `spawnSync osascript ETIMEDOUT`，整个 setup-windows 失败、自愈这一轮白跑。
+//    空载时每个窗口约 5s，满载能到十几秒，所以按最坏情况给 90s。
+const OSA_TIMEOUT = Number(process.env.OSA_TIMEOUT_MS || 90000);
 const osa = (...lines) => execFileSync('osascript',
-  lines.flatMap(l => ['-e', l]), { encoding: 'utf8', timeout: 15000 }).trim();
+  lines.flatMap(l => ['-e', l]), { encoding: 'utf8', timeout: OSA_TIMEOUT }).trim();
 
 const allIds = async () => new Set((await cdp.findTabs(() => true)).map(t => t.targetId));
 

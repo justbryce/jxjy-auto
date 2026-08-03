@@ -21,12 +21,15 @@
 // 只有真的掉了可见性（锁屏 / 窗口被别的全屏窗口盖住）才会动手，而那种情况下
 // 不动手的后果就是**默默地慢 3 倍**。所以默认开启，不做成开关。
 //
-// ── ⚠️ 为什么要常驻，而不是让 cron 每 5 分钟跑一次 ────────────────────────
-// 自愈要靠 `osascript` 建窗口，而 macOS 的 Apple Events 授权是**按"责任进程"**给的。
-// 从 cron / launchd 里跑，责任进程不是你交互式授权过的那个终端 →
-// `osascript` 会**卡住等一个没人看得见的授权弹窗**，最后超时（实测：SIGTERM，15s）。
-// 所以本脚本要以 `--daemon` 常驻，由 `start.sh`（你手动跑的、已授权的上下文）拉起，
-// cron 里的 watchdog 只负责检查它还活着。
+// ── ⚠️ osascript 超时：观察到的真实原因 ──────────────────────────────────
+// 自愈要靠 `osascript` 建窗口。实测失败模式是 `spawnSync osascript ETIMEDOUT`：
+// **6 路视频正在播的时候，Chrome 建一个窗口能花十几秒**（空载约 5s），
+// 原来 setup-windows.mjs 里给的 15s 超时不够用 → 整轮自愈白跑。已放宽到 90s。
+//
+// （曾经怀疑是 macOS 的 Apple Events 授权按"责任进程"给、cron 起的进程卡在
+//   看不见的授权弹窗上 —— 但没有证据支持，实际观察到的就是负载下的超时。
+//   本脚本仍然以 `--daemon` 常驻由 start.sh 拉起：日志更集中、不受 cron 环境差异影响，
+//   顺带也绕开了上面那个"万一真是授权问题"的风险。cron 里的 watchdog 只查它活着。）
 //
 // 用法：
 //   node heal-visibility.mjs           跑一次
@@ -45,7 +48,7 @@ const DRY = process.argv.includes('--dry');
 // 两次自愈之间的冷却。重建窗口 + 重启 runner 有代价（丢掉最多几十秒的播放进度），
 // 而且如果是"永远修不好"的原因（比如 Chrome 整个被别的 App 全屏盖住），
 // 不设冷却就会每 5 分钟重启一次，比不修还糟。
-const COOLDOWN_MIN = Number(process.env.HEAL_COOLDOWN_MIN || 20);
+const COOLDOWN_MIN = Number(process.env.HEAL_COOLDOWN_MIN || 8);
 const STAMP = path.join(HERE, 'state', 'heal.json');
 
 // 需要保持可见的 tab：state 文件 → 字段名
