@@ -218,11 +218,25 @@ hidden 页面会被 Chrome「密集节流」（定时器降到约 1 次/分钟�
 → 速率掉到 30~60%，而且**缓冲区出现断层但网络其实几毫秒就返回**，极具迷惑性。
 
 **解法：给每个要真播视频的 tab 各配一个独立 Chrome 窗口**（`setup-windows.mjs`）。
-⚠️ 前提是**机器不能锁屏 / 屏幕不能休眠** —— 一锁屏**所有**窗口都算 occluded 退回 hidden，
-挪窗口位置、`caffeinate -u` 唤醒显示器都救不回来，只能人到机器前解锁。实测锁屏后：
+**6c. 🔒 锁屏会让已有窗口全部退回 hidden —— 但新建的窗口不会。**
+
+macOS **在锁屏那一刻把当时存在的所有窗口标成 occluded，之后在锁屏期间不再重新计算**。
+于是摆好的专用窗口全部变 `hidden`，速率掉下来。实测影响不均：
 - 网易云（hls.js 靠 JS 定时器拉分片）掉到 **37~84%**
 - 浙江工信（原生 `<video src=*.mp4>`）**不受影响，仍是 100%** ——
-  已经在播的媒体元素不吃定时器节流，被掐死的只是"用 JS 驱动加载"的那类播放器。
+  已经在播的媒体元素不吃定时器节流，被掐死的只是"用 JS 驱动加载"的那类播放器
+
+**解法：锁屏之后新建的窗口是 `visible` 的，而且完全不被节流。**
+实测在锁屏 + 显示器休眠状态下新建窗口，`setInterval` 161 秒整整跑了 161 次（1.000/s），
+`requestAnimationFrame` 也是满帧。所以**重建一次窗口布局就能恢复满速**，
+不用重启 Chrome、不用改锁屏设置、不用加 `--disable-background-timer-throttling` 之类的启动参数。
+
+这件事已经自动化：`heal-visibility.mjs`（watchdog 每 5 分钟调一次）发现专用 tab 变 hidden
+就重建窗口 + 重启 runner，带 20 分钟冷却。屏幕解锁时它是 no-op，所以本地用的人不用管它。
+
+试过但**没用**的（省得再试）：把窗口挪回 y=25（macOS 不会因为窗口移动就重算遮挡）、
+`caffeinate -u -t N` 唤显示器（锁屏时唤不动）、`sudo pmset -a displaysleep 0`
+（断开屏幕共享时 macOS 会直接把显示器睡掉，绕不过）。
 
 判断是不是锁屏了：所有 tab 的 `document.visibilityState` 全是 `hidden`，
 而 `osascript` 查到的前台 app 明明就是 Chrome。

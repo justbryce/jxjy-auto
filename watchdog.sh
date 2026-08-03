@@ -47,6 +47,12 @@ for s in zjsjczx hzrs study163; do
   fi
 done
 
+# 可见性自愈：专用窗口里的 tab 变成 hidden 就重建窗口 + 重启 runner。
+# 最常见的触发原因是机器锁屏（macOS 锁屏时把当时存在的窗口全标成 occluded 且不再重算），
+# 而**锁屏后新建的窗口是 visible 的**，所以重建一次就能恢复满速。详见 heal-visibility.mjs 顶部注释。
+# 本机屏幕解锁时这条是 no-op，不会有任何副作用。
+node heal-visibility.mjs >> "$WLOG" 2>&1
+
 # 汇总面板
 if ! pgrep -f "node dashboard.mjs" >/dev/null; then
   echo "$(ts) dashboard 不在运行，拉起" >> "$WLOG"

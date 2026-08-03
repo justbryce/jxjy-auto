@@ -98,8 +98,9 @@ node progress-check.mjs      # 对比 24 小时内的历史快照，看三个平
        查所有 tab 的 document.visibilityState —
        · 只有 163 那几个 hidden → 窗口被压住了 → node setup-windows.mjs 重建布局
          （之后必须 pkill -f "runners/" && ./start.sh，tab id 只在进程启动时读一次）
-       · **全部 tab 都 hidden，但前台 app 就是 Chrome → 机器锁屏了**，
-         挪窗口、caffeinate -u 都没用，只能让用户到机器前解锁。
+       · **全部 tab 都 hidden，但前台 app 就是 Chrome → 机器锁屏了。**
+         不用让用户解锁 —— **锁屏后新建的窗口仍然是 visible 且不被节流**，
+         所以 node heal-visibility.mjs 就能修（watchdog 每 5 分钟自动跑，一般轮不到你手动跑）。
          注意此时浙江工信仍是 100%（原生 mp4 已在播，不吃定时器节流），只有 163 掉速。
 ```
 
@@ -139,6 +140,7 @@ lib/cdp.mjs          所有 CDP 调用的唯一入口 + 可见性/窗口工具 +
 runners/*.mjs        一个平台一个独立进程，互不影响。结构都是
                      main(){ while(true) try{ loop() } catch{ sleep } }
 setup-windows.mjs    给要真播视频的 tab 各配一个独立可见窗口 —— **决定速度的关键**
+heal-visibility.mjs  发现专用 tab 变 hidden（多半是锁屏）就重建窗口+重启 runner，自带冷却
 dashboard.mjs        :8848 面板，现查平台接口。加平台要在这里加取数函数
 progress-check.mjs   结果导向看门狗。加平台要在这里加产出指标
 watchdog.sh          进程看门狗（cron */5）
