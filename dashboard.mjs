@@ -125,7 +125,8 @@ function runners() {
     try { execSync(`pgrep -f "runners/${s}.mjs"`, { stdio: 'ignore' }); alive = true; } catch { }
     try {
       lines = fs.readFileSync(path.join(HERE, `logs/${s}.log`), 'utf8').trim().split('\n');
-      tail = lines.slice(-12).join('\n');
+      // 倒序：最新的在最上面，扫一眼就知道现在在干什么
+      tail = lines.slice(-12).reverse().join('\n');
     } catch { }
     // 最近 30 分钟里的真故障（自愈类的不算）
     const bad = lines.slice(-200).filter(x => /💥|❌|计时卡住|本轮异常|启动失败|未识别弹窗|登录态|读不到/.test(x)).slice(-3);
@@ -168,10 +169,11 @@ function render(d) {
     hzHtml = `<div class="kpi"><b>${(total?.done ?? 0).toFixed(1)}</b><span>官方已计入学时 / 年度要求 ${total?.need ?? 90}</span></div>
       <table>${rows}</table>
       <p class="note">⚠️ 平台的「已学课程」接口只返回最近 8 条（不是全量），所以别用它加总来估学时；
-      上面这个大数字取的是平台自己算好的官方计入数，才是准的。<br>
+      上面这个大数字取的是平台自己算好的官方计入数（<code>data.study</code>），才是准的。<br>
       <b>学完不会自动结算</b> —— 必须在后台点「学时重算」（每天限 3 次），
-      已自动化为每天 08:05 / 20:05 各一次，所以它会滞后于上面那个实时数。手动催：<code>node recalc.mjs</code>。<br>
-      年度要求：总 90（专业课程 60，公需合计 ≥18）。<b>浙江工信的学时不会流进来</b>，18 公需学时得在本站自己刷。</p>
+      已自动化为每天 08:05 / 20:05 各一次，<b>所以这里的数字最多滞后半天</b>。手动催：<code>node recalc.mjs</code>。<br>
+      年度要求以上表为准（本账号：专业课程 60 是硬性下限，公需不设下限但计入总学时 90）。
+      <b>浙江工信的学时不会流进来</b>，都得在本站自己刷。</p>
       <h4>进行中</h4>${cur}`;
   }
 
@@ -195,12 +197,18 @@ function render(d) {
       return `<div class="act"><div class="aw">${a.w ? `<span class="wk">${a.w}</span>` : ''}${esc(a.what)}</div>
         <div class="ah">${esc(a.how)}${a.rate != null ? ` · <span class="${slow ? 'slow' : 'okr'}">速率 ${a.rate}%</span>` : ''}</div></div>`;
     }).join('') || '<div class="dim">（还没开始）</div>';
+    // 异常报警要带时间戳 —— 不然分不清"刚刚炸了"还是"六小时前炸过一次已经自愈了"。
+    // 同样倒序，最新的在最上面。
     const bad = r.bad?.length
-      ? `<div class="bad">最近异常：<br>${r.bad.map(x => esc(x.replace(/^\S+ \S+ /, ''))).join('<br>')}</div>` : '';
+      ? `<div class="bad">最近异常：${r.bad.slice().reverse().map(x => {
+        const m = x.match(/^(\S+)\s+(\S+)\s+(?:\[\S+\]\s*)?(.*)$/);
+        const [when, what] = m ? [`${m[1].slice(5)} ${m[2]}`, m[3]] : ['', x];
+        return `<br><span class="ts">${esc(when)}</span> ${esc(what)}`;
+      }).join('')}</div>` : '';
     return `<div class="r ${r.alive ? 'on' : 'off'}">
       <b>${r.name}</b> <span class="dim">${r.alive ? '运行中' : '已停止'}</span>
       ${act}${bad}
-      <details><summary>原始日志</summary><pre>${esc(r.tail)}</pre></details></div>`;
+      <details><summary>原始日志（新 → 旧）</summary><pre>${esc(r.tail)}</pre></details></div>`;
   }).join('');
 
   return `<!doctype html><html lang="zh"><head><meta charset="utf-8">
@@ -246,6 +254,7 @@ ul.cur li{margin:3px 0}
 .wk{display:inline-block;min-width:24px;font-size:11px;color:var(--dim)}
 .okr{color:#3aa657}.slow{color:#e0762a}
 .bad{margin-top:10px;font-size:11px;color:#c8443c;line-height:1.6;word-break:break-all}
+.bad .ts{color:var(--dim);font-variant-numeric:tabular-nums;margin-right:4px}
 details{margin-top:10px}
 summary{font-size:11px;color:var(--dim);cursor:pointer}
 </style></head><body>

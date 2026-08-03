@@ -10,8 +10,10 @@
 //    且发现有别人（比如你自己手动）开着 class 页时会让路。
 //  - 必须先「选课」（chooseCourse）课程才会进「我的网络课程」，才能学。
 //
-// 学习顺序：专业课程(工学) → 专业课程(其他) → 行业公需 → 一般公需
-// 年度要求：总 90 学时，其中专业课程 60、公需合计 ≥18。
+// 学习顺序：**不要硬编码**，读平台后台自己给的年度要求（`data.study` 里每类的 r/s，见 finished()）。
+// 谁还差就先补谁；硬性要求都满了再拿没有下限的类别去填总学时。
+// （这个账号 2026 年是：专业课程 60 / 行业公需 0 / 一般公需 0 / 总学时 90，
+//   别的账号未必一样，所以只能现查。）
 
 import * as cdp from '../lib/cdp.mjs';
 import { sleep, evalJs, evalJson } from '../lib/cdp.mjs';
@@ -32,8 +34,6 @@ const TYPE_ORDER = [15, 16, 17];
 const TYPE_NAME = { 15: '专业课程', 16: '行业公需', 17: '一般公需' };
 // 专业课程里优先哪个学科门类，按自己的专业领域改（这里是工学=工信领域）
 const SYSTEM_PRIORITY = { '工学': 0, '理学': 1, '经济学': 2 };
-// 公需（行业+一般）要先攒够这么多学时，再去刷专业课程（年度硬性要求是 ≥18，留点余量）
-const GX_TARGET = Number(process.env.HZ_GX_TARGET || 20);
 
 async function post(target, url, body) {
   return evalJson(target, `(async()=>{const r=await fetch(${JSON.stringify(url)},{method:"POST",
@@ -79,14 +79,22 @@ async function myCourses(ctl) {
   }));
 }
 
-// 已学完的课程（学完后会从「我的网络课程」移出，只在学时后台的已学课程里）。
-// 不排除它们的话，会被目录里重新选回来无限重学。同时统计各类别已拿到的学时。
+// 学时后台首页。两块数据，用途完全不同，别搞混：
+//
+//  · data.course —— 🔴 **只返回最近 8 条**，limit/page 传了也没用。它是「最近学习」小挂件，
+//    不是全量已学课程。拿它当"已完成集合"，学到第 9 门之后最早那几门就会掉出窗口被重新选回来
+//    无限重学；拿它加总当学时，数字会永远卡在 8×0.5=4.0（实测空转了一个半小时）。
+//    所以它只作为**辅助**去重，真正的去重靠 state.data.done + blacklist。
+//
+//  · data.study —— ✅ 平台自己算好的权威学时：每个类别的 r=年度要求 / s=已获得 / w=还差。
+//    这才是唯一可信的数字。注意它**只在点过「学时重算」之后才更新**（见 recalc.mjs），
+//    学习途中是滞后的。
 async function finished(ctl) {
   const j = await post(ctl, '/api/index/Study.UserIndex/index', {});
   const list = (j?.data?.course) || [];
-  const hours = {};
-  for (const x of list) hours[x.coursetype_text] = (hours[x.coursetype_text] || 0) + (+x.period || 0);
-  return { ids: new Set(list.map(x => String(x.courseid))), hours };
+  const req = {};
+  for (const x of (j?.data?.study || [])) req[x.coursetype] = { s: Number(x.s) || 0, r: Number(x.r) || 0 };
+  return { ids: new Set(list.map(x => String(x.courseid))), req };
 }
 
 async function chooseCourse(ctl, ids) {
@@ -272,17 +280,34 @@ async function loop() {
     const black = new Set(state.data.blacklist || []);
     const pending = mine.filter(x => x.vst < x.secs - 5 && !black.has(x.id));
     const fin = await finished(ctl);
-    const doneSet = new Set([...mine.map(x => x.id), ...fin.ids, ...black]);
+    const done = state.data.done ||= {};   // 本进程亲自确认学完的课：{id: {h, type}}
+    const doneSet = new Set([...mine.map(x => x.id), ...fin.ids, ...black, ...Object.keys(done)]);
     let pick = null, already = 0;
 
-    // 年度要求：总 90 = 专业课程 60 + 公需（行业+一般）≥18。
-    // 公需那部分学时通常**必须在本站拿**（「获取继教基地学时」按钮多数账号点了没反应，
-    //    别的平台的学时不会自动流过来 —— 用你自己的账号确认一下），
-    // 而专业课程有 339 门要刷，不先把公需拿掉的话永远轮不到它 → 公需没够就先刷公需。
-    const gxDone = (fin.hours['行业公需'] || 0) + (fin.hours['一般公需'] || 0)
-      + pending.filter(x => x.type === '行业公需' || x.type === '一般公需').reduce((a, b) => a + (b.vst >= b.secs - 5 ? b.h : 0), 0);
-    const order = gxDone < GX_TARGET ? [16, 17, 15] : TYPE_ORDER;
-    if (gxDone < GX_TARGET) log(`公需 ${gxDone.toFixed(1)}/${GX_TARGET} 学时，先补公需`);
+    // 🔑 学什么，由平台后台的权威要求决定，别硬编码。这个账号（2026）是：
+    //      专业课程 要求 60 · 行业公需 要求 0 · 一般公需 要求 0 · 总学时 要求 90
+    //    也就是说 60 学时**必须**是专业课程，剩下 30 学时任何类别都行（公需不设下限但计入总数）。
+    //    → 专业课程还没补满就先刷专业课程；补满了再拿公需去填总学时的余量。
+    //    （历史教训：曾按"公需≥18"的传闻先刷公需，而这个账号公需要求其实是 0。）
+    const spec = fin.req['专业课程'] || { s: 0, r: 60 };
+    const gxSettled = (fin.req['行业公需']?.s || 0) + (fin.req['一般公需']?.s || 0);
+    // data.study 只在「学时重算」后才更新（每天 2~3 次），中间最多滞后半天 →
+    // 加上本进程确认完成、但还没结算的那部分（state.data.pend）。
+    // ⚠️ 这个增量必须在官方数字变化时清零，否则重算之后就变成"官方 + 已被官方吸收的增量"双计。
+    const pend = state.data.pend ||= {};
+    const snap = state.data.snap ||= {};
+    if (snap.spec !== spec.s || snap.gx !== gxSettled) {
+      snap.spec = spec.s; snap.gx = gxSettled;
+      for (const k of Object.keys(pend)) pend[k] = 0;   // 刚重算过，增量已被吸收
+      state.save();
+    }
+    const specDone = spec.s + (pend['专业课程'] || 0);
+    const gxDone = gxSettled + (pend['行业公需'] || 0) + (pend['一般公需'] || 0);
+    const specShort = specDone < spec.r;
+    const order = specShort ? [15, 16, 17] : [16, 17, 15];
+    log(specShort
+      ? `专业课程 ${specDone.toFixed(1)}/${spec.r}（官方计入 ${spec.s}，待结算 +${(specDone - spec.s).toFixed(1)}），先补专业课程`
+      : `专业课程已满，刷公需填总学时（公需已 ${gxDone.toFixed(1)}）`);
 
     for (const type of order) {
       const inProgress = pending.filter(x => x.type === TYPE_NAME[type])
@@ -297,7 +322,7 @@ async function loop() {
       const cand = list[0];
       if (!await chooseCourse(ctl, [cand.id])) { log('选课失败', cand.id); await sleep(60_000); break; }
       log(`＋ 选课《${cand.name}》 ${cand.h}学时 [${cand.sys}/${cand.cat}]（${TYPE_NAME[type]}还剩 ${list.length} 门）`);
-      pick = { id: cand.id, name: cand.name, secs: cand.secs, h: cand.h };
+      pick = { id: cand.id, name: cand.name, secs: cand.secs, h: cand.h, type: TYPE_NAME[type] };
       already = 0;
       break;
     }
@@ -326,17 +351,21 @@ async function loop() {
     const spent = (Date.now() - t0) / 1000;
     if (r === 'done') {
       const after = (await myCourses(ctl)).find(x => x.id === pick.id);
-      if (!after) {
-        log(`  ✅ 《${pick.name}》 完成（已移出我的网络课程）`);
-        state.data.doneCount = (state.data.doneCount || 0) + 1;
-      } else if (spent < (pick.secs - already) * 0.5) {
-        // 平台秒判 finish=1（远不到该课需要的时长），而 validstudytime 纹丝不动 ——
-        // 这门课其实早就拿过学分了，只是被重新选课生成了一条 vst=0 的新记录。
-        // 不拉黑的话会一分钟一轮无限重开（实测能这么空转好几个小时）。
-        // 注意：validstudytime 不是实时更新的（学习中查到的常常还是 0），
-        // 所以判据只能用「用时远小于应需时长」，不能用 vst 有没有涨。
+      // 🔴 顺序不能反！「用时远小于应需时长」必须先判。
+      //    平台对"早就拿过学分又被重新选课"的课会秒判 finish=1，**并且同样把它移出我的网络课程**，
+      //    所以 `!after` 根本不能证明这轮真学到了东西。先看 !after 的话，空转会被记成成功：
+      //    实测这样每轮 ~90s 空转了一个半小时，学时一点没涨，日志里全是 ✅（2026-08-03）。
+      //    判据只能用时间：validstudytime 不是实时的（学习途中查到的常常还是 0），指望不上。
+      if (spent < (pick.secs - already) * 0.5) {
         log(`  ⛔ 只用了 ${Math.round(spent)}s 平台就判完成（该课需 ${pick.secs}s），说明早已拿过学分，拉黑不再选`);
         (state.data.blacklist ||= []).push(pick.id);
+      } else if (!after) {
+        log(`  ✅ 《${pick.name}》 完成（已移出我的网络课程）`);
+        state.data.doneCount = (state.data.doneCount || 0) + 1;
+        // 自己记两笔：done 用来去重（平台的「已学课程」接口只回最近 8 条，指望它必然重学）；
+        // pend 是"已学完但还没重算结算"的学时，用来在两次重算之间也能正确判断该学哪一类。
+        done[pick.id] = { h: pick.h, type: pick.type || '' };
+        if (pick.type) pend[pick.type] = (pend[pick.type] || 0) + pick.h;
       } else {
         log(`  → 本轮学满 ${Math.round(spent)}s，validstudytime=${after.vst}/${after.secs}，下轮继续`);
       }
