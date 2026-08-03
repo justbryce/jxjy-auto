@@ -1,0 +1,331 @@
+#!/usr/bin/env node
+// 站点 3：网易云课堂（study.163.com）—— 把「我的学习」里所有课程逐课时看完
+//
+// 机制（已实测）：
+//  - 我的课程：GET /j/my/courseListV2.json?pageSize=20&pageIndex=N&keyword=&filterType=0&t=<ts>
+//    必须带请求头 edu-script-token = cookie `NTESSTUDYSI`，否则 403（空 body）。
+//    返回 result.list[]：courseId / name / units(总课时) / finishedUnits(已完成课时)。
+//  - 播放器走 HLS/MSE（video.src 是 blob:），进度每 60s 由 DWR LessonLearnBean.updateVideoTime 上报
+//    真实 currentTime → 必须 1x 实播。
+//  - 目录 DOM：.m-chapterList .section[data-id=<lessonId>]，.ksicon 的 title 是状态
+//    （已完成/进行中/未开始），.ksinfo 是 mm:ss 时长。
+//  - ✅ **支持多门课同时播**（实测两个 tab 并发推进互不影响）→ 开 CONCURRENCY 个 worker。
+//  - ⚠️ 新建的 tab 必须 /front 一次才会开始加载媒体（Chrome 对从未可见过的 tab 不加载媒体）；
+//    同一个 tab 之后再切课时就不用了。
+//  - ⚠️ 163 会断点续播，从断点播到尾服务端不判完成 → 每次都从 currentTime=0 播。
+//  - 直播/非视频课时起播会失败（DWR 报 learnableInfo null），自动跳过。
+
+import * as cdp from '../lib/cdp.mjs';
+import { sleep, evalJs, evalJson } from '../lib/cdp.mjs';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+const CONCURRENCY = Number(process.env.NC_CONCURRENCY || 3);
+const POLL = 20_000;
+// 静音播放。⚠️ 只能用 volume=0，**绝不能** muted=true —— 那样 Chrome 会在 play 后约 6ms 直接暂停。
+// （试过用 volume>0 让 Chrome 认为"页面在发声"从而豁免隐藏页节流 —— 行不通，见文件底部 ensureVisible 的注释。）
+const VOLUME = Number(process.env.NC_VOLUME || 0);
+const log = cdp.makeLogger('163');
+const state = cdp.makeState(path.join(HERE, '../state/study163.json'));
+state.data.skipped = state.data.skipped || {};   // courseId -> [lessonId]
+state.data.tries = state.data.tries || {};       // lessonId -> n
+
+const learnUrl = (cid, lid) => `https://study.163.com/course/courseLearn.htm?courseId=${cid}` + (lid ? `#/learn/video?lessonId=${lid}&courseId=${cid}` : '');
+
+const LESSONS = `(()=>JSON.stringify([...document.querySelectorAll(".m-chapterList .section")].map(s=>({
+  id:s.dataset.id, idx:+s.dataset.lesson,
+  name:(s.querySelector(".ksname")||{}).innerText||"",
+  st:(s.querySelector(".ksicon")||{}).title||"",
+  info:((s.querySelector(".ksinfo")||{}).innerText||"").trim()}))))()`;
+
+const VSTAT = `(()=>{const v=document.querySelector("video");
+  if(!v) return JSON.stringify({none:true,url:location.href});
+  return JSON.stringify({cur:v.currentTime,dur:v.duration,paused:v.paused,ready:v.readyState,url:location.href})})()`;
+
+// ⚠️ 不要 await v.play()：加载不动时 Promise 永不 settle，CDP eval 会挂到超时把进程带崩
+const KICK = `(()=>{const v=document.querySelector("video");
+  if(!v) return 0;
+  v.muted=false;v.volume=${VOLUME};v.playbackRate=1;
+  try{const p=v.play();if(p&&p.catch)p.catch(e=>{window.__playErr=e.name})}catch(e){window.__playErr=e.name}
+  return 1})()`;
+
+// ---------- 课程清单 ----------
+async function myCourses(t) {
+  return evalJson(t, `(async()=>{const tk=(document.cookie.match(/(?:^|;\\s*)NTESSTUDYSI=([^;]+)/)||[])[1]||"";
+    const out=[];
+    for(let p=1;p<=10;p++){
+      const r=await fetch("/j/my/courseListV2.json?pageSize=20&pageIndex="+p+"&keyword=&filterType=0&t="+Date.now(),
+        {headers:{"edu-script-token":tk,"Accept":"application/json"}});
+      if(!r.ok) return JSON.stringify({err:r.status});
+      const j=await r.json();
+      // ⚠️ 会话失效时 163 返回的是 HTTP 200 + {code:-2,message:"not_auth"}，不是 401/403。
+      //    不检这个的话会拿到空列表，脚本以为"没课可学"，而视频照播（CDN 不校验登录）——
+      //    结果是进程忙得飞起、一秒学习记录都没有。2026-08-03 就这么空转了十几分钟。
+      if (j && (j.code === -2 || j.message === 'not_auth')) return JSON.stringify({ notAuth: true });
+      const L=(j.result&&j.result.list)||[];
+      out.push(...L.map(x=>({id:String(x.courseId),name:x.name,units:x.units,fin:x.finishedUnits})));
+      if(p>=((j.result&&j.result.query&&j.result.query.totlePageCount)||1))break;}
+    return JSON.stringify({list:out})})()`);
+}
+
+// ---------- worker ----------
+async function ensureTab(w) {
+  const key = `tab${w}`;
+  if (state.data[key] && await cdp.tabAlive(state.data[key])) return state.data[key];
+  const r = await cdp.newTab('https://study.163.com/my#/courses');
+  state.data[key] = r.targetId; state.save();
+  await sleep(8000);
+  // 新 tab 必须可见一次，之后才肯加载媒体
+  await cdp.kickVisible(r.targetId, { waitMs: 3000, tag: '163' });
+  log(`w${w} 新建 tab ${r.targetId}`);
+  return r.targetId;
+}
+
+// 只认真正的浮层：fixed/absolute + z-index 高 + 不包含播放器本身
+// （播放器的控制条 class 里也带 layer，早期版本会把 "10:09 / 14:35 1x 标清" 误报成弹窗）
+async function popupText(t) {
+  return evalJs(t, `(()=>{const out=[];
+    for(const e of document.querySelectorAll("[class*=dialog],[class*=modal],[class*=popup],[class*=u-mask],[class*=confirm]")){
+      if(!e.offsetParent) continue;
+      if(e.querySelector("video")) continue;
+      const cs=getComputedStyle(e);
+      if(!/fixed|absolute/.test(cs.position)) continue;
+      if((Number(cs.zIndex)||0)<10) continue;
+      const tx=(e.innerText||"").trim();
+      if(tx.length>2&&tx.length<300) out.push(tx.slice(0,150));
+    }
+    return [...new Set(out)].join(" | ").slice(0,300)})()`).catch(() => '');
+}
+
+// 播放途中会话也可能失效（比如同一账号在别处登录、或并发流太多被判异常）。
+// DWR 上报接口在会话失效时会返回 SecurityException，比课程列表接口更贴近"进度到底记没记上"。
+async function sessionAlive(t) {
+  const r = await evalJs(t, `(async()=>{try{
+    const q=await fetch("/dwr/call/plaincall/LessonLearnBean.updateVideoTime.dwr",
+      {method:"POST",headers:{"Content-Type":"text/plain"},body:"callCount=1\\npage=/\\nhttpSessionId=\\nscriptSessionId=x\\nc0-scriptName=LessonLearnBean\\nc0-methodName=updateVideoTime\\nc0-id=0\\nbatchId=1\\n"});
+    return (await q.text()).includes("SecurityException") ? "dead" : "ok";
+  }catch(e){return "unknown"}})()`).catch(() => 'unknown');
+  return r !== 'dead';
+}
+
+async function watch(t, w, cid, ls) {
+  log(`w${w} ▶ ${ls.cname ? '《' + ls.cname + '》 ' : ''}课时${ls.idx + 1} ${ls.name} ${ls.info || '(无时长)'}`);
+  await cdp.navigate(t, learnUrl(cid, ls.id));
+  await sleep(9000);
+
+  // 等 <video> 的 duration 和目录里的 mm:ss 对上，避免读到上一课时的残留播放器
+  const want = /^(\d+):(\d+)$/.test(ls.info) ? (+RegExp.$1 * 60 + +RegExp.$2) : 0;
+  for (let i = 0; i < 12 && want; i++) {
+    const s = await evalJson(t, VSTAT).catch(() => null);
+    if (s && !s.none && s.dur > 0 && Math.abs(s.dur - want) <= 5) break;
+    await sleep(3000);
+  }
+
+  // 163 断点续播 → 从头播，否则服务端不判完成
+  await evalJs(t, `(()=>{const v=document.querySelector("video");if(v&&v.currentTime>5)v.currentTime=0;return 1})()`).catch(() => { });
+
+  // 🔑 保持这个 tab 可见 —— 这是 163 能不能跑满 1x 的关键。
+  //    Chrome 对 hidden 页面做密集节流（定时器降到 ~1 次/分钟），hls.js 的分片加载循环被掐住，
+  //    缓冲喂不上 → 速率掉到 30~60%（缓冲区会出现断层，但网络其实几毫秒就返回，很有迷惑性）。
+  //    这台机器平时没人用的话，可以把 Chrome 提到前台 + 把本 tab 设为当前 tab，visibilityState 就是 visible。
+  //    （试过用 volume>0 让 Chrome 认为"在发声"从而豁免节流 —— 行不通：有声播放需要 user activation，
+  //      而 CDP 的合成点击在这个页面上拿不到 activation，play() 一直抛 NotAllowedError。）
+  await cdp.clickAt(t, 'video').catch(() => { });
+  await sleep(1200);
+
+  let s = null;
+  for (let i = 0; i < 5; i++) {
+    await evalJs(t, KICK).catch(() => { });
+    await sleep(3000);
+    s = await evalJson(t, VSTAT).catch(() => null);
+    if (s && !s.none && !s.paused && s.dur > 0) break;
+    if (i === 1) await cdp.kickVisible(t, { waitMs: 3500, tag: '163' });   // 媒体没起来，踢一下可见性
+    await cdp.clickAt(t, 'video').catch(() => { });
+  }
+  if (!s || s.none || !(s.dur > 0)) {
+    const pu = await popupText(t);
+    log(`w${w}   起播失败${pu ? ' 弹窗:' + pu.slice(0, 100) : ''}（多半是直播/非视频课时）`);
+    return 'skip';
+  }
+
+  await ensureVisible(t, w);
+
+  let last = -1, stall = 0, lastPct = -1;
+  const t0 = Date.now(), startCur = s.cur || 0;
+  while (Date.now() - t0 < 4 * 3600_000) {
+    await sleep(POLL);
+    const v = await evalJson(t, VSTAT).catch(() => null);
+    if (!v || v.none) { log(`w${w}   播放器丢了`); return 'retry'; }
+    if (!String(v.url).includes(`lessonId=${ls.id}`)) { log(`w${w}   页面跳走了`); return 'retry'; }
+    if (v.dur && v.cur >= v.dur - 2) {
+      log(`w${w}   ✓ 播完`);
+      // 163 平台不统计学时，自己记账：课时 -> 秒数（去重，重播不重复计）
+      (state.data.watched ||= {})[ls.id] = { c: cid, s: Math.round(v.dur), name: ls.name, at: Date.now() };
+      state.save();
+      await sleep(10000);
+      return 'done';
+    }
+
+    if (v.paused || Math.abs(v.cur - last) < 1) {
+      if (++stall >= 3) {
+        const pu = await popupText(t);
+        if (pu) {
+          log(`w${w}   ⚠ 疑似弹窗:`, pu.slice(0, 120));
+          await cdp.screenshot(t, path.join(HERE, `../logs/163-popup-${Date.now()}.png`)).catch(() => { });
+          await evalJs(t, `(()=>{const b=[...document.querySelectorAll("a,button,span,div")]
+            .find(e=>e.offsetParent&&/^(继续学习|我知道了|确定|好的|继续观看|知道了)$/.test((e.innerText||"").trim()));
+            if(b){b.click();return 1}return 0})()`).catch(() => { });
+        }
+        log(`w${w}   卡在 ${Math.round(v.cur)}s，重新唤起`);
+        await evalJs(t, KICK).catch(() => { });
+        stall = 0;
+      }
+    } else stall = 0;
+    last = v.cur;
+
+    // 速率明显掉下来通常就是丢了可见性（别的 runner 抢走 /front，或者 Chrome 被别的窗口盖住）
+    if (v.cur > startCur + 30) {
+      const rate = (v.cur - startCur) / ((Date.now() - t0) / 1000);
+      if (rate < 0.8) await ensureVisible(t, w);
+    }
+
+    const pct = v.dur ? Math.floor(v.cur / v.dur * 10) * 10 : 0;
+    if (pct !== lastPct) {
+      lastPct = pct;
+      // 播放速率：Chrome 对多个隐藏 tab 里同时播的视频会限速，低于 100% 说明被throttle了
+      const rate = Math.round((v.cur - startCur) / ((Date.now() - t0) / 1000) * 100);
+      log(`w${w}   ${pct}%  ${Math.round(v.cur)}/${Math.round(v.dur)}s  速率${rate}%`);
+    }
+  }
+  return 'timeout';
+}
+
+// 让本 tab 真正 visible：先把 Chrome 窗口提到前台（不然被遮挡时当前 tab 也是 hidden），
+// 再把本 tab 设为当前 tab。restore:false —— 我们要占住这个槽位不还。
+let lastEnsure = 0, yieldLogged = 0;
+async function ensureVisible(t, w) {
+  try {
+    const vis = await evalJs(t, 'document.visibilityState').catch(() => null);
+    if (vis === 'visible') return;
+    if (Date.now() - lastEnsure < 30_000) return;      // 别太频繁地抢
+    lastEnsure = Date.now();
+
+    // 🚦 礼让：可见槽位只有一个。如果占着它的是别人的 tab（比如别的高优先级自动化任务，
+    //    那个靠真实点击工作、优先级远高于刷课），就不抢 —— 宁可慢一半也不能干扰它。
+    const cur = await cdp.visibleTab().catch(() => null);
+    if (cur && !isOurTab(cur)) {
+      if (Date.now() - yieldLogged > 600_000) {
+        yieldLogged = Date.now();
+        const info = await cdp.info(cur).catch(() => null);
+        log(`w${w}   可见槽位被别的任务占着（${(info?.url || '?').slice(0, 50)}），让路，本站会慢一些`);
+      }
+      return;
+    }
+
+    // 实测：即便把本 tab 设为当前 tab，只要它所在的 Chrome 窗口被别的窗口盖住（前台常被别的 App 占着），
+    // visibilityState 依然是 hidden，抢也没用。而抢的代价是可能把可见槽位从别的任务手里拿走。
+    // 收益不确定 + 有风险 → 不抢，只记录。163 慢一半可以接受（它不产生学时）。
+    if (Date.now() - yieldLogged > 1800_000) {
+      yieldLogged = Date.now();
+      log(`w${w}   tab 处于后台，Chrome 会限速 hls.js 的分片加载（约 30~60% 速率），属已知现象`);
+    }
+  } catch { }
+}
+
+// 本项目自己开的 tab（三个站的 runner 都把 tab id 存在 state/ 里）
+function isOurTab(id) {
+  try {
+    for (const f of ['study163.json', 'zjsjczx.json', 'hzrs.json']) {
+      const d = JSON.parse(fs.readFileSync(path.join(HERE, '../state/' + f), 'utf8'));
+      if (Object.values(d).includes(id)) return true;
+    }
+  } catch { }
+  return false;
+}
+
+// 读某门课的课时目录。必须整页加载课程页 —— watch() 用过的页面上，课时状态是"开播之前"的旧快照。
+async function lessonsOf(t, cid) {
+  await cdp.navigate(t, learnUrl(cid));
+  await sleep(9000);
+  for (let i = 0; i < 8; i++) {
+    const all = (await evalJson(t, LESSONS).catch(() => [])) || [];
+    if (all.length) return all;
+    await sleep(3000);
+  }
+  return [];
+}
+
+// 把所有未学完课程的待学课时拉平成一个队列。
+// 为什么按"课时"而不是按"课程"分派：163 只剩两门大课时，按课程分派最多只能开 2 个 worker；
+// 实测同一门课的不同课时可以在不同 tab 里同时播，按课时分派就不受课程数限制了。
+async function buildQueue(t, courses) {
+  const q = [];
+  for (const c of courses) {
+    const all = await lessonsOf(t, c.id);
+    if (!all.length) { log(`  读不到《${c.name}》的课时列表，跳过这门`); continue; }
+    const skipped = state.data.skipped[c.id] || [];
+    const todo = all.filter(x => x.st !== '已完成' && !skipped.includes(x.id));
+    log(`  《${c.name}》 ${all.length} 课时，已完成 ${all.filter(x => x.st === '已完成').length}，跳过 ${skipped.length}，待学 ${todo.length}`);
+    for (const ls of todo) q.push({ cid: c.id, cname: c.name, ...ls });
+  }
+  return q;
+}
+
+async function loop() {
+  const t0 = await ensureTab(0);
+  const res = await myCourses(t0);
+  if (res?.notAuth) {
+    log('❌ 登录态失效（接口返回 not_auth）—— 视频还能播但一秒都不会被记录，先停下来。请在 Chrome 里重新登录 study.163.com，10 分钟后自动重试');
+    await sleep(600_000);
+    return;
+  }
+  if (!res || res.err) { log(`❌ 取课程列表失败(${res?.err})，10 分钟后重试`); await sleep(600_000); return; }
+
+  const courses = res.list.filter(c => c.fin < c.units);
+  log(`我的学习：${res.list.length} 门课，未学完 ${courses.length} 门，共 ${res.list.reduce((a, b) => a + b.units, 0)} 课时（已完成 ${res.list.reduce((a, b) => a + b.fin, 0)}）`);
+  if (!courses.length) return 'finished';
+
+  courses.sort((a, b) => (a.units - a.fin) - (b.units - b.fin));   // 小课先清掉
+  const queue = await buildQueue(t0, courses);
+  if (!queue.length) { log('没有待学课时了，10 分钟后重查'); await sleep(600_000); return; }
+  log(`本轮队列共 ${queue.length} 个课时，${Math.min(CONCURRENCY, queue.length)} 个 worker 并行`);
+
+  let next = 0;
+  const workers = Array.from({ length: Math.min(CONCURRENCY, queue.length) }, (_, w) => (async () => {
+    const t = w === 0 ? t0 : await ensureTab(w);
+    while (true) {
+      const task = queue[next++];
+      if (!task) return;
+      if (!await sessionAlive(t)) {
+        log(`w${w} ❌ 登录态失效，停止本轮（请重新登录 study.163.com）`);
+        return;
+      }
+      try {
+        const r = await watch(t, w, task.cid, task);
+        if (r === 'skip' || r === 'timeout') {
+          (state.data.skipped[task.cid] ||= []).push(task.id);
+          log(`w${w}   → 跳过（${r}）`);
+        } else if (r === 'done') {
+          const n = (state.data.tries[task.id] = (state.data.tries[task.id] || 0) + 1);
+          if (n >= 3) { (state.data.skipped[task.cid] ||= []).push(task.id); log(`w${w}   → 播了 ${n} 遍仍未标完成，跳过`); }
+        }
+        state.save();
+      } catch (e) { log(`w${w} ⚠ 课时出错:`, e.message); await sleep(20_000); }
+      await sleep(4000);
+    }
+  })());
+  await Promise.all(workers);
+}
+
+async function main() {
+  while (true) {
+    try {
+      if (await loop() === 'finished') { log('🎉 所有课程都学完了，退出'); return; }
+    } catch (e) { log('⚠ 本轮异常，30 秒后继续:', e.message); await sleep(30_000); }
+    await sleep(10_000);
+  }
+}
+
+main().catch(e => { log('💥', e.stack); process.exit(1); });
