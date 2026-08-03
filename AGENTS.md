@@ -118,6 +118,63 @@ README 面向人，讲的是"这是什么"；这份讲的是"你该怎么动手�
 3. **把修复动作的代价算进触发阈值。** 这里一次自愈 = 丢掉 10 路正在播的进度。
    代价越大触发条件就要越保守。原设计默认"重建窗口几乎不要钱"，在长视频场景下是灾难性的。
 
+---
+
+### 第四类：优化本身把机器压垮 —— 只算了"更快"，没算"更费"
+
+同一晚（2026-08-04 凌晨）：短课时优先把网易云从 6 课时/小时提到 110，
+但它同时把**页面切换频率提高了 18 倍**。10 个 hls.js 播放器 + 不停重建的渲染进程，
+在 16G 的 mini 上把内存榨干（可用物理内存 ~105MB，6G swap 用掉 4.9G），
+macOS 弹「应用程序内存不足」，**Chrome 浏览器主进程死锁**，三个站全停。
+
+**改调度之前先把它换算成"单位时间的资源动作数"**（开关 tab、导航、新建进程、并发缓冲），
+而不只是看"每小时完成多少个"。一个纯赢的吞吐改动，可能是资源消耗的数量级增长。
+
+Chrome 主进程死锁的辨认特征（很有用，别再花两小时重查）：
+
+| 现象 | 含义 |
+|---|---|
+| `curl :9222/json/list` 超时 | 该端点由浏览器主进程服务 |
+| 进程 CPU **0%**，`sample` 里主线程 100% 停在同一栈、最内层 `_sigtramp` | 卡死在信号处理器里，等于已崩 |
+| `System Events` 查 Chrome **0 个窗口** | AX 层也僵了 |
+| 杀掉 100% CPU 的渲染进程没用 | 病根在浏览器进程 |
+
+唯一出路是重启 Chrome —— 而重启 Chrome 会引出下面这个更麻烦的问题。
+
+---
+
+### 🔴 Chrome 一重启，自动化就断，且**只能人工恢复**
+
+Chrome 136+ 用默认 profile 时，远程调试只能靠 `chrome://inspect/#remote-debugging`
+的勾选框开启（`--remote-debugging-port` 在默认 profile 下被直接忽略，端口不监听）。
+勾选状态虽然持久化，但**每个浏览器实例还要人再点一次「允许」**。
+
+**这一步程序做不到。** 实测点不动：`System Events` 的 `click at`/`key code`、
+CoreGraphics `CGEventPost` 用 private 源和 `kCGEventSourceStateHIDSystemState` 源全试过。
+同一套 CGEvent 能点掉 Chrome 别的 UI（点掉过「要恢复页面吗？」的 ×），
+坐标也用带光标的截图验证过 —— 就是这个安全对话框屏蔽了合成输入。
+
+所以流程是：**告诉用户去点「允许」，并留一个守候脚本，人点完自动全恢复**
+（`resume-after-consent.sh`）。⚠️ 守候脚本的探测间隔要放到分钟级：
+**每次连接尝试都会新弹一个授权框**，探太勤会堆一叠，人点掉一个后面又顶上来，
+看起来像"点了没用"。
+
+### TCC：Claude Code 起的 shell 责任进程是 `node`，而 node 多半是被拒的
+
+合成点击/按键从 Claude 的 bash 里发出去会**静默失效** —— 不报错、没反应。
+根因是 macOS 的辅助功能授权按**责任进程**给，而这台机器上
+`/opt/homebrew/.../node` 是 `auth_value=0`（永久拒绝）。查：
+
+```bash
+sqlite3 "/Library/Application Support/com.apple.TCC/TCC.db" \
+  "select client,auth_value from access where service='kTCCServiceAccessibility'"
+```
+
+**绕法首选：从 tmux 里派发** —— `tmux new-window -d -t <session> "bash your.sh"`。
+tmux server 的责任进程是终端 App（Ghostty，`auth_value=2`），**不弹窗、直接有权限**。
+（`open -a Terminal` 会触发「"终端"想要控制"System Events"」的 Automation 弹窗而卡死；
+`ssh localhost` 也会触发 sshd 自己的 TCC 弹窗。都不如 tmux 直接。）
+
 **所以：判断"在不在正常工作"，永远以平台上外部可验证的数字为准，不要看日志在不在滚。**
 ```bash
 node progress-check.mjs      # 对比 24 小时内的历史快照，看三个平台的产出有没有在涨

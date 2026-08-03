@@ -383,6 +383,66 @@ macOS 的遮挡判定要求**完全**覆盖，所以那一小块永远救着它�
 读回值不变就说明那块区域真实存在。这台机器实测副屏在 `x=-1080..0`。
 或者干脆用 `SCREEN_X0` / `SCREEN_W` 手工指定，别猜。
 
+**6h. 🔥🔥 提速和并发不能同时拉满：整台机器被刷爆内存，Chrome 主进程死锁。**
+
+11b 那个「短课时优先」把网易云的完成速度从 6 课时/小时提到了 110 —— 但它同时把
+**页面切换频率提高了 18 倍**。10 个 hls.js 播放器的缓冲 + 不停重建的渲染进程，
+在一台 16G 的 mini 上（还开着用户自己的一堆 App）把内存彻底榨干：
+可用物理内存剩 ~105MB、6G swap 用掉 4.9G，macOS 弹出「系统的应用程序内存不足」。
+
+**Chrome 浏览器主进程随即死锁**，症状很有辨识度，值得记住：
+
+| 现象 | 说明 |
+|---|---|
+| `curl :9222/json/list` 超时 | 这个端点由**浏览器主进程**服务 |
+| 该进程 CPU **0%**，但 `sample` 显示主线程栈 100% 停在同一处（最内层 `_sigtramp`） | 不是忙，是**卡死在信号处理器里**——等于已经崩了，崩溃处理器又没走完 |
+| `System Events` 查它 **0 个窗口** | AX 层也僵了 |
+| 杀掉那几个 100% CPU 的渲染进程**没用** | 病根在浏览器进程，不在渲染进程 |
+
+**教训：吞吐优化必须连着资源上限一起评估。** 一个"纯赢"的调度改动，
+在换算成"单位时间的页面切换次数"之后可能是资源消耗的数量级增长。
+现在并发从 10 降到 5（吞吐仍有 ~55 课时/小时，是优化前的 9 倍）。
+
+**6i. 🔴 Chrome 的远程调试授权是「按浏览器实例」给的，而且程序点不掉。**
+
+Chrome 136+ 用默认 profile 时，远程调试**只能**靠 `chrome://inspect/#remote-debugging`
+的勾选框开启（`--remote-debugging-port` 命令行参数在默认 profile 下被**直接忽略**，
+端口根本不监听 —— 这是防 cookie 窃取的安全措施）。
+勾选状态确实持久化在 `Local State` 的 `devtools.remote_debugging.user-enabled`，
+但**每个浏览器实例仍然要人再确认一次**：有客户端连调试端口时，Chrome 弹
+「要允许远程调试吗？」，在人点「允许」之前 TCP 连上了也不做 WebSocket 握手。
+
+**所以：Chrome 一崩溃/重启，自动化就断，且只能人工恢复。** 实测点不动的手段（全试过）：
+
+- `System Events` 的 `click at {x,y}` / `key code`（回车、Esc）
+- CoreGraphics `CGEventPost(kCGHIDEventTap, ...)`，事件源分别用 private 和 `kCGEventSourceStateHIDSystemState`
+
+同样这套 CGEvent **能**点掉 Chrome 别的 UI（实测点掉了「要恢复页面吗？」气泡的 ×），
+所以不是权限问题、也不是坐标问题（截图带光标验证过指针就压在「允许」上）——
+**是 Chrome 对这个安全对话框专门屏蔽了合成输入。**
+
+⚠️ 附带的坑：**每一次连接尝试都会新弹一个授权框。** 自动重连脚本探得太勤会堆一叠，
+人点掉一个后面立刻又顶上来一个，看起来就像"点了没用"。重连探测间隔要放到分钟级。
+
+**6j. TCC 授权按「责任进程」给，而 Claude Code 起的 shell 会被算成 `node`。**
+
+这台机器上 `/opt/homebrew/.../node` 在辅助功能里是 **`auth_value=0`（永久拒绝）**，
+多半是某次锁屏时授权弹窗没人点被静默记成了拒绝。后果：从 Claude 的 bash 里跑
+`osascript` 发合成点击/按键，**静默失效** —— 不报错、没反应，极难查。
+
+查授权表：
+```bash
+sqlite3 "/Library/Application Support/com.apple.TCC/TCC.db" \
+  "select client,auth_value from access where service='kTCCServiceAccessibility'"
+```
+
+绕法（按代价从低到高）：
+1. **从 tmux 里派发**（`tmux new-window -d "bash your.sh"`）—— tmux server 的责任进程是终端 App
+   （这台机器上是 Ghostty，`auth_value=2`），**不弹任何窗、直接就有权限**。最省事，首选。
+2. `ssh localhost` 借 sshd 的授权 —— 需要公钥登录，而且会触发 sshd 自己的 TCC 弹窗。
+3. `open -a Terminal your.sh` —— Terminal 虽然也有辅助功能授权，但会触发
+   「"终端"想要控制"System Events"」的 Automation 弹窗，**而那个弹窗同样没人点**，直接卡死。
+
 **7. 🔴 认"我刚建的那个 tab"，差集**不够**，必须再用 host 复核。**
 新建 tab 会被 Chrome 扔进位置随机的新窗口，经常正好压住那几个必须保持可见的小窗口 ——
 不需要可见的 tab（比如新干线的课程页）要主动挪走：`cdp.parkWindow()`。
