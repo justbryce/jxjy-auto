@@ -5,6 +5,10 @@ cd "$(dirname "$0")" || exit 1
 mkdir -p logs state
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 STUCK_MIN=25
+
+# 维护暂停：./pause.sh 建了这个标记就什么都别做。
+# 否则人在重新登录平台 / 调窗口布局的时候，会被本脚本 5 分钟一次地把 runner 拉起来打断。
+if [ -f state/PAUSED ]; then exit 0; fi
 WLOG=logs/watchdog.log
 ts() { date '+%Y-%m-%d %H:%M:%S'; }
 

@@ -29,7 +29,10 @@ const POLL = 20_000;
 const VOLUME = Number(process.env.NC_VOLUME || 0);
 const log = cdp.makeLogger('163');
 const state = cdp.makeState(path.join(HERE, '../state/study163.json'));
-state.data.skipped = state.data.skipped || {};   // courseId -> [lessonId]
+state.data.skipped = state.data.skipped || {};   // courseId -> [lessonId]（永久跳过）
+state.data.fails = state.data.fails || {};       // lessonId -> 连续失败次数（成功即清零）
+// 连续失败多少次才认定"这个课时真的学不了"。别设成 1 —— 环境临时坏掉会成批误杀。
+const SKIP_AFTER = Number(process.env.NC_SKIP_AFTER || 3);
 state.data.tries = state.data.tries || {};       // lessonId -> n
 
 const learnUrl = (cid, lid) => `https://study.163.com/course/courseLearn.htm?courseId=${cid}` + (lid ? `#/learn/video?lessonId=${lid}&courseId=${cid}` : '');
@@ -82,11 +85,34 @@ async function pauseAll() {
 }
 
 // ---------- worker ----------
+// 回收上一代进程留下的 tab。
+// runner 被 pkill / 看门狗重启时，它自己建的 tab 全都留在 Chrome 里没人收 ——
+// 重启十几次就能攒出几十个 tab，既占内存，又把 CDP 代理的 session 拖爆
+// （实测 11 个活着的 tab 对应 184 个 session，代理慢到光列 tab 就要 13 秒，
+//  连带把汇总面板卡成"服务挂了"）。
+// 只关**我们自己建过**的（记在 state.owned 里），绝不按 URL 乱扫 ——
+// 这是用户日常的 Chrome，他自己开的 163 页面不能碰。
+async function reapOrphanTabs() {
+  const owned = state.data.owned || [];
+  const inUse = new Set(Object.entries(state.data)
+    .filter(([k]) => /^tab\d+$/.test(k)).map(([, v]) => v));
+  let n = 0;
+  for (const id of owned) {
+    if (inUse.has(id)) continue;
+    if (await cdp.tabAlive(id)) { await cdp.closeTab(id).catch(() => { }); n++; }
+  }
+  state.data.owned = [...inUse];
+  state.save();
+  if (n) log(`回收上一代残留的 ${n} 个 tab`);
+}
+
 async function ensureTab(w) {
   const key = `tab${w}`;
   if (state.data[key] && await cdp.tabAlive(state.data[key])) return state.data[key];
   const r = await cdp.newTab('https://study.163.com/my#/courses');
-  state.data[key] = r.targetId; state.save();
+  state.data[key] = r.targetId;
+  (state.data.owned ||= []).push(r.targetId);
+  state.save();
   // 等页面真的落到 study.163.com 再用它打接口 —— 页面还停在 about:blank 时，
   // 相对路径的 fetch 会解析到错误的 origin，接口直接 404，很有迷惑性。
   for (let i = 0; i < 12; i++) {
@@ -287,7 +313,10 @@ async function buildQueue(t, courses) {
   const q = [];
   for (const c of courses) {
     const all = await lessonsOf(t, c.id);
-    if (!all.length) { log(`  读不到《${c.name}》的课时列表，跳过这门`); continue; }
+    // 读不到课时列表**几乎不可能是"这门课真的没有课时"**，而是页面没渲染出来或登录态出问题
+    // （实测：Chrome 的 Google 账号掉线那会儿，十几门课连着读不到）。
+    // 所以只是本轮跳过、下一轮还会重试，不要落盘成永久跳过。
+    if (!all.length) { log(`  读不到《${c.name}》的课时列表（页面没渲染出来？登录态？），本轮跳过，下轮重试`); continue; }
     const skipped = state.data.skipped[c.id] || [];
     const todo = all.filter(x => x.st !== '已完成' && !skipped.includes(x.id));
     log(`  《${c.name}》 ${all.length} 课时，已完成 ${all.filter(x => x.st === '已完成').length}，跳过 ${skipped.length}，待学 ${todo.length}`);
@@ -296,7 +325,10 @@ async function buildQueue(t, courses) {
   return q;
 }
 
+let reaped = false;
 async function loop() {
+  // 进程刚起来时收一次上一代的残留 tab（只做一次，之后不用重复扫）
+  if (!reaped) { reaped = true; await reapOrphanTabs().catch(e => log('回收残留 tab 失败:', e.message)); }
   const t0 = await ensureTab(0);
   const res = await myCourses(t0);
   if (res?.notAuth) {
@@ -331,9 +363,23 @@ async function loop() {
       try {
         const r = await watch(t, w, task.cid, task);
         if (r === 'skip' || r === 'timeout') {
-          (state.data.skipped[task.cid] ||= []).push(task.id);
-          log(`w${w}   → 跳过（${r}）`);
+          // 🔴 **不要凭一次失败就永久跳过。**
+          // skip/timeout 里混着两种完全不同的事：
+          //   ① 这个课时真的不是视频（直播预告、"务必添加班主任微信"那种）—— 该永久跳过
+          //   ② 环境临时坏了（登录态掉线、Chrome 抽风、页面没渲染出来）—— 一会儿就好了
+          // 两者返回值一模一样，凭一次就落盘的话，环境一坏就会成批判死 ——
+          // 实测 Chrome 的 Google 账号掉线那阵子，一口气废掉了 86 个课时
+          // （整门《Rust编程语言基础教程》26 个课时全军覆没）。
+          // 所以要连着失败 SKIP_AFTER 次才永久跳过；失败计数在成功时清零。
+          const f = (state.data.fails[task.id] = (state.data.fails[task.id] || 0) + 1);
+          if (f >= SKIP_AFTER) {
+            (state.data.skipped[task.cid] ||= []).push(task.id);
+            log(`w${w}   → 连续 ${f} 次${r}，永久跳过`);
+          } else {
+            log(`w${w}   → 本次${r}（第 ${f}/${SKIP_AFTER} 次），下轮还会再试`);
+          }
         } else if (r === 'done') {
+          delete state.data.fails[task.id];
           const n = (state.data.tries[task.id] = (state.data.tries[task.id] || 0) + 1);
           if (n >= 3) { (state.data.skipped[task.cid] ||= []).push(task.id); log(`w${w}   → 播了 ${n} 遍仍未标完成，跳过`); }
         }
