@@ -16,6 +16,7 @@
 //  - 直播/非视频课时起播会失败（DWR 报 learnableInfo null），自动跳过。
 
 import * as cdp from '../lib/cdp.mjs';
+import { displayAsleep } from '../lib/display.mjs';
 import { sleep, evalJs, evalJson } from '../lib/cdp.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -194,6 +195,15 @@ async function watch(t, w, cid, ls) {
     await cdp.clickAt(t, 'video').catch(() => { });
   }
   if (!s || s.none || !(s.dur > 0)) {
+    // 🔴 起播失败之前，先排除"整个环境根本不具备播放条件"。
+    // 显示器休眠时，hidden 页面被节流到定时器 ~1 次/分钟，163 的 SPA **连 <video> 都挂载不出来**，
+    // 于是**每一个**课时都会"起播失败"。这时候如果照常记失败计数，
+    // 三轮下来就会把整个队列永久跳过 —— 又一次"拿环境故障给课程判死刑"。
+    if (s?.none && displayAsleep()) {
+      log(`w${w}   ⏸ 显示器休眠，页面被节流到播放器都挂载不出来 —— 这不是课时的问题，等 5 分钟再说`);
+      await sleep(300_000);
+      return 'env';        // 上层不会把 'env' 计入失败次数
+    }
     const pu = await popupText(t);
     log(`w${w}   起播失败${pu ? ' 弹窗:' + pu.slice(0, 100) : ''}（多半是直播/非视频课时）`);
     return 'skip';
@@ -362,6 +372,7 @@ async function loop() {
       }
       try {
         const r = await watch(t, w, task.cid, task);
+        if (r === 'env') { next--; continue; }   // 环境问题，这个课时原样放回去重试，不计失败
         if (r === 'skip' || r === 'timeout') {
           // 🔴 **不要凭一次失败就永久跳过。**
           // skip/timeout 里混着两种完全不同的事：

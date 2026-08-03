@@ -41,6 +41,7 @@ import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import * as cdp from './lib/cdp.mjs';
+import { displayAsleep } from './lib/display.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const log = cdp.makeLogger('heal');
@@ -76,6 +77,23 @@ async function main() {
 
   if (!bad.length) { log(`${want.length} 个专用 tab 都是 visible，无需处理`); return; }
   log(`⚠ ${bad.length}/${want.length} 个专用 tab 丢了可见性：` + bad.map(b => `${b.who}=${b.vis}`).join(' '));
+
+  // 🔴 **显示器睡着的时候绝对不能自愈。**
+  // 自愈的原理是"新建的窗口是 visible 的"，但那只在**屏幕锁了、显示器还亮着**时成立。
+  // 显示器一睡，连新建窗口也是 occluded —— 重建不但没用，还会把**本来能播的老 tab 换成永远播不了的新 tab**
+  // （网易云的新 tab 必须可见过一次才肯挂载播放器），等于自己把还能跑的部分毁掉。实测踩过。
+  if (displayAsleep()) {
+    log('  🚨 显示器处于休眠状态 —— 重建窗口也救不回来（新窗口同样是 occluded），本轮不动手。');
+    log('     网易云会彻底停摆（SPA 播放器在被节流的 hidden 页里挂载不出来），另外两站不受影响。');
+    log('     唤不醒是实测结论：caffeinate -u/-dimsu、敲键、pmset 全试过。只能人到机器前唤醒屏幕。');
+    try {
+      const A = path.join(HERE, 'logs', 'ALERT.log');
+      const last = fs.existsSync(A) ? fs.statSync(A).mtimeMs : 0;
+      if (Date.now() - last > 30 * 60_000)     // 半小时最多告警一次，别刷屏
+        fs.appendFileSync(A, `${new Date().toLocaleString('zh-CN')} 🚨 显示器休眠，网易云停摆（需人工唤醒屏幕）\n`);
+    } catch { }
+    return;
+  }
   log('  原因多半是机器锁屏（macOS 锁屏时把当时存在的窗口全标成 occluded，之后不再重算）');
 
   let stamp = {};
@@ -104,9 +122,27 @@ async function main() {
   log('✅ 自愈完成');
 }
 
+// 🔒 单实例锁。两个守护同时跑会**互相打架**：各自建一整套窗口，彼此覆盖，
+// 结果新建的窗口也全是 hidden，自愈反而把情况弄得更糟（实测踩到，日志里满屏
+// 「有 2 个新 tab 都是 X，取第一个」就是这个race 的信号）。
+// 用 PID 文件 + 存活校验，比 pgrep 可靠（pgrep 在不同调用上下文里会漏匹配）。
+const PIDFILE = path.join(HERE, 'state', 'heal.pid');
+function claimSingleton() {
+  try {
+    const old = Number(fs.readFileSync(PIDFILE, 'utf8').trim());
+    if (old && old !== process.pid) {
+      try { process.kill(old, 0); return false; }   // 还活着 → 让位
+      catch { /* 进程没了，可以接管 */ }
+    }
+  } catch { }
+  fs.writeFileSync(PIDFILE, String(process.pid));
+  return true;
+}
+
 if (process.argv.includes('--daemon')) {
+  if (!claimSingleton()) { log('已经有一个自愈守护在跑了，本进程退出（避免两个实例互相覆盖窗口）'); process.exit(0); }
   const every = Number(process.env.HEAL_INTERVAL_SEC || 300) * 1000;
-  log(`常驻模式启动，每 ${every / 1000}s 检查一次`);
+  log(`常驻模式启动（pid ${process.pid}），每 ${every / 1000}s 检查一次`);
   // 单次异常不能把守护进程带走 —— 它挂了就没人修可见性了，而那种失败是"静默变慢"，最难发现。
   for (; ;) {
     await main().catch(e => log('💥 本轮异常，继续:', e.message));

@@ -62,11 +62,13 @@ fi
 
 # 可见性自愈守护进程。放在这里拉起（而不是让 cron 每 5 分钟跑一次）：
 # 日志集中、不受 cron 环境差异影响。详见 heal-visibility.mjs 顶部注释。
-if ! pgrep -f "heal-visibility.mjs --daemon" >/dev/null; then
+# 起之前先按 PID 文件确认没有在跑的（脚本自身也有单实例锁兜底，重复起会自己退出）
+HEAL_PID=$(cat state/heal.pid 2>/dev/null || echo "")
+if [ -n "$HEAL_PID" ] && kill -0 "$HEAL_PID" 2>/dev/null; then
+  echo "· 可见性自愈守护 已在运行 (pid $HEAL_PID)"
+else
   nohup node heal-visibility.mjs --daemon >> logs/heal.log 2>&1 &
   echo "✅ 可见性自愈守护 已启动"
-else
-  echo "· 可见性自愈守护 已在运行"
 fi
 
 SITES=("$@")

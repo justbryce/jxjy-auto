@@ -13,7 +13,7 @@ if [ "$1" = "off" ]; then
   exec ./start.sh
 fi
 date '+%Y-%m-%d %H:%M:%S' > "$FLAG"
-pkill -f "heal-visibility.mjs --daemon"
+pkill -f "heal-visibility.mjs --daemon"; rm -f state/heal.pid
 pkill -f "runners/"
 sleep 2
 echo "⏸  已暂停：runner 全停，看门狗不会再拉起（标记文件 $FLAG）"
