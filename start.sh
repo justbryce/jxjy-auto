@@ -34,6 +34,14 @@ export HZ_PLAY_VIDEO="${HZ_PLAY_VIDEO:-0}"
 # 改这里之后记得跑：NC_CONCURRENCY=<n> node setup-windows.mjs
 export NC_CONCURRENCY="${NC_CONCURRENCY:-3}"
 
+# ./pause.sh 会建 state/PAUSED 让 cron 里的 watchdog 整个跳过。
+# 直接跑 start.sh 恢复的话，runner 是起来了，但看门狗还停摆着 —— 静默的陷阱。
+# 既然你已经在启动了，就顺手把暂停标记清掉，并明确说一声。
+if [ -f state/PAUSED ]; then
+  rm -f state/PAUSED
+  echo "· 检测到暂停标记，已清除（看门狗恢复工作）"
+fi
+
 start() {
   local name=$1
   if pgrep -f "runners/$name.mjs" >/dev/null; then
