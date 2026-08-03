@@ -185,7 +185,8 @@ async function learn(ctl, c, already) {
     await sleep(2000);
   }
   const v = await startVideo(tab).catch(e => { log('  起播异常（不影响计时）:', e.message); return null; });
-  if (!v || v.none) log('  该课件没有 <video>（html 课件），只靠页面计时');
+  if (!PLAY_VIDEO) log('  未开启视频播放（HZ_PLAY_VIDEO≠1），只靠页面计时 —— 本站学时本来就不看视频');
+  else if (!v || v.none) log('  该课件没有 <video>（html 课件），只靠页面计时');
   else if (!v.src) log('  <video> 无 src（html 课件），只靠页面计时');
   else log(`  视频: ready=${v.ready} paused=${v.paused} ${v.err || ''}`);
 

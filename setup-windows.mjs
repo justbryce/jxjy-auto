@@ -10,7 +10,8 @@
 // 把小窗口顶边放在 y=25（主窗口从 y≈122 起），即使主窗口被抬到上层，
 // 小窗口顶部那条仍然露着 → Chrome 认为它 visible。实测有效。
 //
-// 用法：node setup-windows.mjs   （会重启对应 runner）
+// 用法：node setup-windows.mjs  然后 **pkill -f "runners/" && ./start.sh**
+//      （必须真重启：runner 的 tab id 只在进程启动时读一次 state/，不重启不会接管新 tab）
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -83,4 +84,4 @@ try {
   log(`主窗口（共 ${n} 个窗口）已抬回最前`);
 } catch (e) { log('抬主窗口失败:', e.message); }
 
-log('完成。记得重启 zjsjczx / study163 让它们接管新 tab。');
+log('完成。现在执行：pkill -f "runners/" && ./start.sh  —— 必须真重启才会接管新 tab');

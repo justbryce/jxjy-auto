@@ -3,14 +3,28 @@
   "version": "1.0.0",
   "description": "在你自己的 Chrome 里自动、按 1x 真实速度连续播放继续教育平台的课程视频",
   "type": "module",
-  "private": false,
+  "private": true,
   "license": "MIT",
-  "engines": { "node": ">=22" },
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
     "start": "./start.sh",
     "status": "./status.sh",
     "hours": "node hours.mjs",
     "windows": "node setup-windows.mjs",
     "proxy": "node tools/cdp-proxy.mjs"
+  },
+  "keywords": [
+    "继续教育",
+    "cdp",
+    "chrome-devtools-protocol",
+    "automation",
+    "video",
+    "学时"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/OWNER/jxjy-auto.git"
   }
 }

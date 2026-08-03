@@ -3,7 +3,7 @@
 //
 // 机制（已实测）：服务端只认真实播放 —— 播放页每 30s POST /jeecg-boot/zg/student/sync/progress
 // {coursewareId,currentTime,duration}，服务端存 longesttime 取最大值。所以必须 1x 实播。
-// 目标：把站内所有未完成课件播完（当前只剩 行业公需 zgcZglType=3）。
+// 目标：把站内所有未完成课件播完，按 行业公需 → 专业科目 → 一般公需 的顺序。
 
 import * as cdp from '../lib/cdp.mjs';
 import { sleep, evalJs, evalJson } from '../lib/cdp.mjs';

@@ -37,7 +37,7 @@ README 面向人，讲的是"这是什么"；这份讲的是"你该怎么动手�
 
 | 用户说 | 你做什么 |
 |---|---|
-| "跑起来" / "怎么启动" | `./start.sh`（会自动拉起 CDP 代理）。然后 `node setup-windows.mjs` 再 `./start.sh` 一次 |
+| "跑起来" / "怎么启动" | `./start.sh`（会自动拉起 CDP 代理）→ `node setup-windows.mjs` → **`pkill -f "runners/" && ./start.sh`**。<br>最后这步必须真 pkill：`start.sh` 会跳过已在跑的 runner，而 tab id 只在进程启动时读一次盘 |
 | "现在什么进度" | `node hours.mjs`（命令行）或 `curl -s localhost:8848/json`（结构化） |
 | "卡住了 / 没在动" | 走下面「排错决策树」 |
 | "加一个新平台" | 抄 `runners/` 里最像的那个；README 末尾有三个必答问题 |
@@ -161,4 +161,4 @@ grep 速率 logs/study163.log | tail
 - 不要为了"提速"去改上报数据、跳过视频内容、或者调 `playbackRate`。
 - 不要停掉那个 CDP 代理，除非你确认没有别的工具在用它。
 - 不要在没量过的情况下调并发。
-- 不要把 `state/` `logs/` `LOCAL.md` 提交进 git（`.gitignore` 已排除，别绕过）。
+- 不要把 `state/` `logs/` 和本机私有笔记提交进 git（`.gitignore` 已排除，别绕过）。

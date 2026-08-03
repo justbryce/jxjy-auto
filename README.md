@@ -62,9 +62,13 @@ open http://localhost:8848  # 📊 汇总面板，每 60 秒自动刷新（/json
 想让需要真播视频的站点跑满 1x（**强烈建议**，否则只有 30~60% 速度，见「坑 6」）：
 
 ```bash
-node setup-windows.mjs      # 给每个要真播视频的 tab 各配一个独立 Chrome 小窗口
-./start.sh                  # 重启让 runner 接管新 tab
+node setup-windows.mjs           # 给每个要真播视频的 tab 各配一个独立 Chrome 小窗口
+pkill -f "runners/" && ./start.sh   # 必须真重启：runner 只在启动时读一次 state 里的 tab id
 ```
+
+⚠️ **一定要 `pkill` 再 `start`**。`./start.sh` 对已经在跑的 runner 是跳过的，
+而 tab id 只在进程启动时从 `state/` 读一次、之后全在内存里 ——
+不重启的话 runner 还在用它自己建的旧 tab，窗口优化完全没生效，而且你不会收到任何提示。
 
 ### 常用命令
 
@@ -138,6 +142,7 @@ runners/hzrs.mjs              杭州新干线
 runners/study163.mjs          网易云课堂
 tools/cdp-proxy.mjs           自带的最小 CDP 代理（start.sh 会在没有现成代理时自动拉起）
 AGENTS.md / CLAUDE.md         给 AI agent 的上手指南（后者是前者的软链）
+LICENSE / package.json        MIT；package.json 里有 npm start/status/hours/windows/proxy 几个快捷脚本
 state/                        运行状态（tab id、黑名单、跳过的课时…）
 logs/                         日志 + 异常截图
 ```

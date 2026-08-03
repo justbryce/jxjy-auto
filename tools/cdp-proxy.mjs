@@ -119,7 +119,24 @@ const json = (res, code, obj) => {
 };
 const body = req => new Promise(r => { let d = ''; req.on('data', c => d += c); req.on('end', () => r(d)); });
 
+// 🔒 只接受来自本机、且 Host 头确实是 localhost 的请求。
+// 不校验的话有两个真实风险：
+//  · 你浏览的任意网页都能 fetch('http://localhost:3456/new?url=...') —— 简单 GET 无预检，
+//    跨域只挡响应不挡副作用，/navigate /close /front 同理；
+//  · 配合 DNS rebinding（把攻击域名解析到 127.0.0.1 绕过同源）能拿到 targetId，
+//    进而用 /eval 在你**已登录的任意站点**里执行 JS、用 /screenshot?file= 往任意路径写文件。
+// 这是"接管日常浏览器"这类工具的经典攻击面，务必保留。
+function allowed(req) {
+  if (req.headers.origin) return false;               // 浏览器发起的跨域请求一律拒
+  const h = String(req.headers.host || '');
+  return h === `127.0.0.1:${PORT}` || h === `localhost:${PORT}`;
+}
+
 http.createServer(async (req, res) => {
+  if (!allowed(req)) {
+    res.writeHead(403, { 'Content-Type': 'application/json; charset=utf-8' });
+    return res.end(JSON.stringify({ error: '只接受 Host 为 127.0.0.1/localhost 且不带 Origin 的本机请求' }));
+  }
   const u = new URL(req.url, 'http://x');
   const p = u.pathname, q = u.searchParams, t = q.get('target');
   try {

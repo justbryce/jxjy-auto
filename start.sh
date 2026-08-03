@@ -9,12 +9,13 @@ mkdir -p logs state
 
 # CDP 代理：已经有一个在跑就用它（比如你自己另外起的），没有就拉起仓库自带的那个。
 CDP_PROXY="${CDP_PROXY:-http://localhost:3456}"
-if curl -s -m 3 "$CDP_PROXY/health" >/dev/null 2>&1; then
+if curl -sf -m 3 "$CDP_PROXY/health" >/dev/null 2>&1; then
   echo "· CDP 代理已在运行 ($CDP_PROXY)"
 else
-  PORT="${CDP_PROXY##*:}" nohup node tools/cdp-proxy.mjs >> logs/cdp-proxy.log 2>&1 &
+  CDP_PORT="${CDP_PROXY##*:}"; [[ "$CDP_PORT" =~ ^[0-9]+$ ]] || CDP_PORT=3456
+  PORT="$CDP_PORT" nohup node tools/cdp-proxy.mjs >> logs/cdp-proxy.log 2>&1 &
   sleep 2
-  if curl -s -m 5 "$CDP_PROXY/health" >/dev/null 2>&1; then
+  if curl -sf -m 5 "$CDP_PROXY/health" >/dev/null 2>&1; then
     echo "✅ CDP 代理已启动 ($CDP_PROXY)"
   else
     echo "❌ CDP 代理起不来。检查：① Chrome 是否开了远程调试"

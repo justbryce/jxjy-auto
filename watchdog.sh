@@ -10,9 +10,10 @@ ts() { date '+%Y-%m-%d %H:%M:%S'; }
 
 # CDP 代理必须活着（不重启已有的）
 CDP_PROXY="${CDP_PROXY:-http://localhost:3456}"
-if ! curl -s -m 5 "$CDP_PROXY/health" >/dev/null 2>&1; then
+if ! curl -sf -m 5 "$CDP_PROXY/health" >/dev/null 2>&1; then
   echo "$(ts) CDP 代理不通，拉起仓库自带的" >> "$WLOG"
-  PORT="${CDP_PROXY##*:}" nohup node tools/cdp-proxy.mjs >> logs/cdp-proxy.log 2>&1 &
+  CDP_PORT="${CDP_PROXY##*:}"; [[ "$CDP_PORT" =~ ^[0-9]+$ ]] || CDP_PORT=3456
+  PORT="$CDP_PORT" nohup node tools/cdp-proxy.mjs >> logs/cdp-proxy.log 2>&1 &
   sleep 2
 fi
 
