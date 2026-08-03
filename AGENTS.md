@@ -77,8 +77,14 @@ node progress-check.mjs      # 对比 24 小时内的历史快照，看三个平
 ├─ 登录态还在吗？        node hours.mjs  → 报"登录态失效/取数失败"就是过期了
 │   └─ 过期 → 只能让用户在 Chrome 里手动重新登录，脚本不碰登录
 ├─ CDP 代理通吗？        curl -s localhost:3456/health
-│   └─ 不通 → Chrome 是不是关了远程调试？是不是有别的工具占着调试连接？
-│             （Chrome 同一时间只允许一个 /devtools/browser 连接）
+│   ├─ 完全不通 → 代理进程没了，./start.sh 会拉起
+│   └─ 通但 "connected":false → 代理连不上 Chrome。查：
+│        · Chrome 关了远程调试？
+│        · 有别的工具占着调试连接？（同一时间只允许一个 /devtools/browser）
+│        · **最常见：代理重连触发了 Chrome 的「允许调试」授权弹窗，而机器锁屏没人点。**
+│          这个同意状态是 per-instance 内存标志，Chrome 配置里没有持久化，
+│          没有任何绕法（page 级端点、/json/version、osascript 点弹窗都试过，全不行），
+│          只能人工解锁 + 点「允许」。所以**永远不要随便重启这个代理**。
 └─ 速率不对（163 特有）  日志里的「速率 xx%」低于 90%
     └─ tab 丢了可见性 → node setup-windows.mjs 重建窗口布局
 ```
@@ -159,6 +165,7 @@ grep 速率 logs/study163.log | tail
 
 - 不要替用户登录、不要处理验证码、不要存凭据。
 - 不要为了"提速"去改上报数据、跳过视频内容、或者调 `playbackRate`。
-- 不要停掉那个 CDP 代理，除非你确认没有别的工具在用它。
+- **不要停掉那个 CDP 代理。** 别用 `pkill -f cdp-proxy` 这种模糊匹配（会连用户其他工具的代理一起杀），
+  要杀只杀自己按 PID 记下来的那个。重启代理的代价是不对称的：杀掉一秒钟，恢复可能要人到机器前解锁点弹窗。
 - 不要在没量过的情况下调并发。
 - 不要把 `state/` `logs/` 和本机私有笔记提交进 git（`.gitignore` 已排除，别绕过）。

@@ -10,6 +10,15 @@ ts() { date '+%Y-%m-%d %H:%M:%S'; }
 
 # CDP 代理必须活着（不重启已有的）
 CDP_PROXY="${CDP_PROXY:-http://localhost:3456}"
+# 代理进程活着、但连不上 Chrome —— 这种情况下三个 runner 只会一直 timeout 空转。
+# 典型原因：代理重连时 Chrome 弹了「允许调试」授权框，而机器锁屏没人点
+# （那个同意状态是 per-instance 的内存标志，Chrome 配置里没有持久化，只能人工点）。
+HEALTH=$(curl -sf -m 5 "$CDP_PROXY/health" 2>/dev/null)
+if [ -n "$HEALTH" ] && ! echo "$HEALTH" | grep -q '"connected":true'; then
+  echo "$(ts) 🚨 CDP 代理活着但连不上 Chrome（多半是授权弹窗没人点 / 机器锁屏）" >> logs/ALERT.log
+  osascript -e 'display notification "CDP 代理连不上 Chrome，请解锁机器并在 Chrome 里点「允许」调试授权" with title "继续教育自动学习"' 2>/dev/null
+fi
+
 if ! curl -sf -m 5 "$CDP_PROXY/health" >/dev/null 2>&1; then
   echo "$(ts) CDP 代理不通，拉起仓库自带的" >> "$WLOG"
   CDP_PORT="${CDP_PROXY##*:}"; [[ "$CDP_PORT" =~ ^[0-9]+$ ]] || CDP_PORT=3456
