@@ -208,6 +208,20 @@ for (const p of PLAN) {
   log(`${p.key} → ${id.slice(0, 8)} bounds=${p.bounds.join(',')} visible=${vis}`);
 }
 
+// 🔴 并发调小之后，state 里会留着上一轮多出来的 tabN（比如 10 路降到 5 路，tab5~tab9 还在）。
+// 它们指向的 tab 早就没了，而 heal-visibility 的 wantVisible() 会把它们读成"tab 没了"
+// → 每轮都判定掉速 → 反复重建窗口重启 runner。**是自愈循环的又一个入口**，必须清掉。
+try {
+  const f = path.join(HERE, 'state', 'study163.json');
+  const d = JSON.parse(fs.readFileSync(f, 'utf8'));
+  const stale = Object.keys(d).filter(k => { const m = /^tab(\d+)$/.exec(k); return m && Number(m[1]) >= W; });
+  if (stale.length) {
+    for (const k of stale) delete d[k];
+    fs.writeFileSync(f, JSON.stringify(d, null, 1));
+    log(`清掉 ${stale.length} 个超出当前并发(${W})的残留 tab 记录：${stale.join(' ')}`);
+  }
+} catch { }
+
 // 主窗口抬回最前，这样后续 /new 建的新 tab（hzrs 每门课都会建）落在主窗口里，
 // 不会挤进我们这几个专用小窗口把它们的 active tab 顶掉。
 try {
