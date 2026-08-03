@@ -87,7 +87,14 @@ async function ensureTab(w) {
   if (state.data[key] && await cdp.tabAlive(state.data[key])) return state.data[key];
   const r = await cdp.newTab('https://study.163.com/my#/courses');
   state.data[key] = r.targetId; state.save();
-  await sleep(8000);
+  // 等页面真的落到 study.163.com 再用它打接口 —— 页面还停在 about:blank 时，
+  // 相对路径的 fetch 会解析到错误的 origin，接口直接 404，很有迷惑性。
+  for (let i = 0; i < 12; i++) {
+    await sleep(2000);
+    const u = await cdp.info(r.targetId).then(x => x?.url || '').catch(() => '');
+    if (u.includes('study.163.com')) break;
+  }
+  await sleep(3000);
   // 新 tab 必须可见一次，之后才肯加载媒体
   await cdp.kickVisible(r.targetId, { waitMs: 3000, tag: '163' });
   log(`w${w} 新建 tab ${r.targetId}`);
@@ -110,13 +117,18 @@ async function popupText(t) {
     return [...new Set(out)].join(" | ").slice(0,300)})()`).catch(() => '');
 }
 
-// 播放途中会话也可能失效（比如同一账号在别处登录、或并发流太多被判异常）。
-// DWR 上报接口在会话失效时会返回 SecurityException，比课程列表接口更贴近"进度到底记没记上"。
+// 播放途中会话也可能失效（同一账号在别处登录、并发流太多被判异常……）。
+// ⚠️ 别用手工构造的 DWR 请求来探活：`httpSessionId` 我们拿不到，服务端**无论登没登录**
+//    都会回 SecurityException，是个 100% 的假阳性（踩过）。
+//    用课程列表接口最准：会话正常 code:0，失效时 HTTP 200 + code:-2 not_auth。
 async function sessionAlive(t) {
   const r = await evalJs(t, `(async()=>{try{
-    const q=await fetch("/dwr/call/plaincall/LessonLearnBean.updateVideoTime.dwr",
-      {method:"POST",headers:{"Content-Type":"text/plain"},body:"callCount=1\\npage=/\\nhttpSessionId=\\nscriptSessionId=x\\nc0-scriptName=LessonLearnBean\\nc0-methodName=updateVideoTime\\nc0-id=0\\nbatchId=1\\n"});
-    return (await q.text()).includes("SecurityException") ? "dead" : "ok";
+    const tk=(document.cookie.match(/(?:^|;\\s*)NTESSTUDYSI=([^;]+)/)||[])[1]||"";
+    const q=await fetch("/j/my/courseListV2.json?pageSize=1&pageIndex=1&keyword=&filterType=0&t="+Date.now(),
+      {headers:{"edu-script-token":tk,"Accept":"application/json"}});
+    if(!q.ok) return "unknown";
+    const j=await q.json();
+    return (j&&(j.code===-2||j.message==="not_auth")) ? "dead" : "ok";
   }catch(e){return "unknown"}})()`).catch(() => 'unknown');
   return r !== 'dead';
 }

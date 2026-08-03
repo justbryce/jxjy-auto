@@ -134,12 +134,19 @@ async function playCourse(target, c) {
   }
   if (!started) { log('  启动失败，跳过'); return 'retry'; }
 
-  let last = -1, stall = 0, lastPct = -1;
+  let last = -1, stall = 0, lastPct = -1, pollErr = 0;
   const t0 = Date.now(), budget = (c.len + 1200) * 1000;
   while (Date.now() - t0 < budget) {
     await sleep(POLL);
     let s;
-    try { s = await videoState(target); } catch (e) { log('  轮询失败', e.message); continue; }
+    try { s = await videoState(target); pollErr = 0; }
+    catch (e) {
+      log('  轮询失败', e.message);
+      // Chrome 重启过的话 tab id 就没了，这里会一直 "No target with given id found"。
+      // 不跳出去的话会在这个循环里空转到 budget 用完（最长 40 分钟）。
+      if (++pollErr >= 3) { log('  连续 3 次轮询失败，回上层重建 tab'); state.data.target = null; state.save(); return 'retry'; }
+      continue;
+    }
     if (!s || s.none || !s.url.includes(`id=${c.id}`)) { log('  页面丢失'); return 'retry'; }
     if (s.dur && s.cur >= s.dur - 2) { log(`  ✓ 播完`); return 'done'; }
 

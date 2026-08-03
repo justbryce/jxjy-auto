@@ -47,7 +47,13 @@ async function ensureCtl() {
   const r = await cdp.newTab(ORIGIN + '/#/Learn');
   state.data.ctl = r.targetId; state.save();
   log('新建控制 tab', r.targetId);
-  await sleep(6000);
+  // 等页面真的落到本站再用它打接口 —— 还停在 about:blank 时相对路径 fetch 会打到错误的 origin
+  for (let i = 0; i < 12; i++) {
+    await sleep(2000);
+    const u = await cdp.info(r.targetId).then(x => x?.url || '').catch(() => '');
+    if (u.includes('learning.hzrs.hangzhou.gov.cn')) break;
+  }
+  await sleep(3000);
   return r.targetId;
 }
 
@@ -296,7 +302,15 @@ async function loop() {
       break;
     }
     if (!pick && pending.length) { pick = pending[0]; already = pick.vst; }   // 兜底：类型名对不上的
-    if (!pick) { log('🎉 没有可学的课了'); return 'finished'; }
+    if (!pick) {
+      // ⚠️ 「目录接口一门都没返回」≠「真的学完了」。控制 tab 刚建出来还没加载完时，
+      //    同源 fetch 会失败/返回空，误判成 finished 就直接退出进程了（踩过）。
+      //    真的学完的判据是：目录里确实有课，只是全都在已完成集合里。
+      const probe = await catalog(ctl, 15);
+      if (!probe.length) { log('❌ 目录接口没返回任何课程（页面没加载好？登录态？），2 分钟后重试'); await sleep(120_000); continue; }
+      log('🎉 没有可学的课了');
+      return 'finished';
+    }
 
     // 兜底防死循环：同一门课连续被选中 5 次还没进展，直接拉黑
     if (pick.id === repeatId) { repeatN++; } else { repeatId = pick.id; repeatN = 1; }
