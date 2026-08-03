@@ -122,6 +122,24 @@ async function fieldOk(ctl, courseid) {
   return String(v).split(',').map(s => s.trim()).includes(FIELD_ID);
 }
 
+// 跨平台缺口：问面板要三个平台汇总后的「专业/公需 还差多少」。
+// 拿不到就返回 null（调用方退回本站自己的年度要求），绝不因为面板没起来就停摆。
+async function crossGap() {
+  try {
+    const r = await fetch(`http://127.0.0.1:${process.env.PORT || 8848}/json`,
+      { signal: AbortSignal.timeout(8000) });
+    const j = await r.json();
+    const q = t => j.hz?.v?.req?.find(x => x.t === t)?.done || 0;
+    const spec = q('专业课程') + (j.nc?.v?.hours || 0);
+    const gx = (j.zj?.v?.gen || 0) + (j.zj?.v?.ind || 0) + q('行业公需') + q('一般公需');
+    if (j.zj?.err || j.nc?.err) return null;          // 有平台取不到数，汇总就是错的，别据此调度
+    return {
+      specLeft: Math.max(0, Number(process.env.GOAL_SPEC || 180) - spec),
+      gxLeft: Math.max(0, Number(process.env.GOAL_GX || 90) - gx),
+    };
+  } catch { return null; }
+}
+
 // ---- 别人在学吗 ----
 async function foreignClassTab(mine) {
   const ts = await cdp.findTabs(t => t.url.includes('learning.hzrs.hangzhou.gov.cn/#/class'));
@@ -323,11 +341,27 @@ async function loop() {
     }
     const specDone = spec.s + (pend['专业课程'] || 0);
     const gxDone = gxSettled + (pend['行业公需'] || 0) + (pend['一般公需'] || 0);
-    const specShort = specDone < spec.r;
-    const order = specShort ? [15, 16, 17] : [16, 17, 15];
-    log(specShort
-      ? `专业课程 ${specDone.toFixed(1)}/${spec.r}（官方计入 ${spec.s}，待结算 +${(specDone - spec.s).toFixed(1)}），先补专业课程`
-      : `专业课程已满，刷公需填总学时（公需已 ${gxDone.toFixed(1)}）`);
+
+    // 真正的目标是**三个平台加起来**达标，所以"先学哪一类"要看**跨平台缺口**，
+    // 而不是本站自己的年度要求。面板（dashboard.mjs）已经把三个平台的数汇总好了，
+    // 直接问它，保持单一事实源；问不到就退回本站自己的要求。
+    //
+    // 为什么公需优先：本站**一般公需便宜得离谱**（最省的 ~10 分钟就给 1 学时，
+    // 而专业课要 ~35 分钟），是所有平台里最划算的学时来源。公需缺口先在这儿填掉，
+    // 剩下的产能全给专业课 —— 专业课那 157 学时的缺口主要靠网易云 3 路并行去啃。
+    const cross = await crossGap();
+    let gxFirst, why;
+    if (cross) {
+      gxFirst = cross.gxLeft > 0;
+      why = gxFirst
+        ? `跨平台公需还差 ${cross.gxLeft.toFixed(1)}（本站一般公需最便宜），先补公需`
+        : `跨平台公需已达标，专业还差 ${cross.specLeft.toFixed(1)}，刷专业课`;
+    } else {
+      gxFirst = specDone >= spec.r;
+      why = `（拿不到跨平台数，按本站要求）专业 ${specDone.toFixed(1)}/${spec.r}`;
+    }
+    const order = gxFirst ? [17, 16, 15] : [15, 17, 16];
+    log(`${why}｜本站：专业 ${specDone.toFixed(1)} 公需 ${gxDone.toFixed(1)}（官方计入 ${spec.s}/${gxSettled}）`);
 
     for (const type of order) {
       const inProgress = pending.filter(x => x.type === TYPE_NAME[type])
