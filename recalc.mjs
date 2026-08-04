@@ -28,9 +28,24 @@ async function main() {
     if (!before) { log('❌ 读不到学时（登录态过期？）'); return; }
     log('重算前：', fmt(before));
 
+    // 🔴 `/#/backIndex` 这个后台路由的守卫读的是 **localStorage 的 `use_info`**，
+    //    不是 cookie。而 axios 的响应拦截器只要收到任何 `status == -1`（"请先登录"）
+    //    就会把 `use_info` / `front_token` / `token` 一起删掉。
+    //    于是会出现一个很迷惑的中间态：**接口通、课照学、学时照记，但后台页面进不去** ——
+    //    cookie 还有效（`Auth.index/isLogin` 返回 1），只是 localStorage 被清空了，
+    //    路由守卫把你悄悄弹回首页（URL 停在 #/backIndex，渲染的却是首页）。
+    //    这种状态只能**人在 Chrome 里点一次「学员登录」重新登录**才能恢复，脚本补不了
+    //    （硬造 use_info 要猜字段结构，风险大于收益）。
+    const state = await evalJs(t, `(()=>localStorage.getItem("use_info")?1:0)()`).catch(() => null);
+    if (!Number(state)) {
+      log('❌ 后台页面进不去：localStorage 里没有 use_info（登录态被"请先登录"的响应拦截器清掉了）');
+      log('   接口其实还是通的（课照学、学时照记），只是**后台页面**要人重新点一次「学员登录」。');
+      log('   恢复后再跑一次本脚本即可；未结算的学时不会丢，只是数字暂时不涨。');
+      return;
+    }
     const opened = await evalJs(t, `(()=>{const b=[...document.querySelectorAll("button")].find(x=>/学时重算/.test(x.innerText));
       if(!b) return 0; b.click(); return 1})()`);
-    if (!opened) { log('❌ 找不到「学时重算」按钮'); return; }
+    if (!opened) { log('❌ 找不到「学时重算」按钮（页面结构可能变了）'); return; }
     await sleep(3000);
 
     const ok = await evalJs(t, `(()=>{const b=document.querySelector(".el-message-box");if(!b)return 0;
