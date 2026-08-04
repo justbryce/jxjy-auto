@@ -265,7 +265,9 @@ function render(d) {
   }
 
   const rs = d.runners.map(r => {
-    const many = (r.act || []).length >= 5;
+    // 多路并行时只是把活动列表排得紧凑一点，**不再把整张卡片拉成通栏**。
+    // 通栏是为 10 路并发做的，5 路并发下它只会把网易云挤到另外两站下面，很难看。
+    const many = (r.act || []).length >= 4;
     const items = (r.act || []).map(a => {
       const slow = a.rate != null && a.rate < 70;
       return `<div class="act"><div class="aw">${a.w ? `<span class="wk">${a.w}</span>` : ''}${esc(a.what)}</div>
@@ -281,7 +283,7 @@ function render(d) {
         return `<br><span class="ts">${esc(when)}</span> ${esc(what)}`;
       }).join('')}</div>` : '';
     const n = (r.act || []).length;
-    return `<div class="r ${r.alive ? 'on' : 'off'}${many ? ' wide' : ''}">
+    return `<div class="r ${r.alive ? 'on' : 'off'}">
       <b>${r.name}</b> <span class="dim">${r.alive ? '运行中' : '已停止'}${n > 1 ? ` · ${n} 路并行` : ''}</span>
       ${act}${bad}
       <details><summary>原始日志（新 → 旧）</summary><pre>${esc(r.tail)}</pre></details></div>`;
@@ -323,8 +325,9 @@ ul.cur li{margin:3px 0}
 .runners{margin-top:20px;display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(300px,1fr))}
 /* worker 多的时候（网易云 10 路）这张卡横跨整行，activity 排成网格，
    不然 10 条竖着堆会把页面拉得很长。少于 5 个时保持原来的单列。 */
-.r.wide{grid-column:1/-1}
-.acts{display:grid;gap:6px 14px;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));margin-top:6px}
+/* .r.wide 已废弃：通栏是为 10 路并发做的，5 路下只会把网易云挤到另外两站下面 */
+.acts{display:grid;gap:4px 14px;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));margin-top:6px}
+.acts .act{font-size:12px;line-height:1.45}
 .acts .act{margin:0}
 .r{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px}
 .r b{font-size:13px}.r.on b::before{content:"● ";color:#3aa657}.r.off b::before{content:"● ";color:#c8443c}
