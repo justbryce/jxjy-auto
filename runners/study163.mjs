@@ -235,7 +235,22 @@ async function watch(t, w, cid, ls) {
     await sleep(POLL);
     const v = await evalJson(t, VSTAT).catch(() => null);
     if (!v || v.none) { log(`w${w}   播放器丢了`); return 'retry'; }
-    if (!String(v.url).includes(`lessonId=${ls.id}`)) { log(`w${w}   页面跳走了`); return 'retry'; }
+    // ⚠️ URL 变了**不一定是出错** —— 视频播到头时 163 的 SPA 会**自己跳到下一课时**，
+    //    URL 里的 lessonId 跟着变。这时候上一课时其实是**学完了**。
+    //    以前一律记成「页面跳走了」+ retry：行为上无害（retry 不烧跳过计数，队列每轮从平台重建，
+    //    平台已判完成的课时下轮自然被过滤掉），但**日志把成功写成了失败的样子**，
+    //    对账时极容易误判成空转 —— 实测「✓ 播完」只占真实完成量的 1/4，剩下 3/4 全躲在这条里。
+    //    现在按最后一次已知进度区分：≥90% 就是播完了，别再冤枉它。
+    if (!String(v.url).includes(`lessonId=${ls.id}`)) {
+      if (lastPct >= 90) {
+        log(`w${w}   ✓ 播完（平台自动跳到了下一课时）`);
+        (state.data.watched ||= {})[ls.id] = { c: cid, s: Math.round(last > 0 ? last : 0), name: ls.name, at: Date.now() };
+        state.save();
+        return 'done';
+      }
+      log(`w${w}   页面跳走了（当时才 ${lastPct < 0 ? '?' : lastPct}%，不是正常播完）`);
+      return 'retry';
+    }
     if (v.dur && v.cur >= v.dur - 2) {
       log(`w${w}   ✓ 播完`);
       // 163 平台不统计学时，自己记账：课时 -> 秒数（去重，重播不重复计）
