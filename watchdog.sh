@@ -76,7 +76,10 @@ fi
 
 # 登录态失效告警
 for s in zjsjczx hzrs study163; do
-  if [ -f "logs/$s.log" ] && tail -20 "logs/$s.log" | grep -q "登录态"; then
+  # ⚠️ 只认**明确的失败标记**，别匹配"登录态"三个字 —— runner 的诊断文案里有
+  #    「（页面没渲染出来？登录态？）」这种带问号的猜测，匹配宽了就是假警报。
+  #    2026-08-04 踩过：163 一切正常、速率 100%，却报了一条"疑似登录态失效"。
+  if [ -f "logs/$s.log" ] && tail -20 "logs/$s.log" | grep -qE "❌ 登录态失效|not_auth|登录态可能过期"; then
     echo "$(ts) ⚠️ $s 疑似登录态失效" >> logs/ALERT.log
     osascript -e "display notification \"$s 登录态可能过期，需要重新登录\" with title \"继续教育自动学习\"" 2>/dev/null
   fi

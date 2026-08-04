@@ -84,9 +84,13 @@ function recentRate() {
 function wantVisible() {
   const out = [];
   const read = f => { try { return JSON.parse(fs.readFileSync(path.join(HERE, 'state', f), 'utf8')); } catch { return null; } };
-  const zj = read('zjsjczx.json');
+  // 🔴 停用的站（state/DISABLED-<站名>）不能算进来：它的 tab 本来就该没了，
+  //    而"tab 没了"会绕过速率闸门直接触发自愈 —— 于是每轮都判定要修，
+  //    一直重启 runner。2026-08-04 停掉浙江工信之后立刻踩到（幸好指数退避拦住了）。
+  const disabled = k => fs.existsSync(path.join(HERE, 'state', `DISABLED-${k}`));
+  const zj = disabled('zjsjczx') ? null : read('zjsjczx.json');
   if (zj?.target) out.push({ who: 'zj', tab: zj.target });
-  const nc = read('study163.json');
+  const nc = disabled('study163') ? null : read('study163.json');
   if (nc) for (const [k, v] of Object.entries(nc)) if (/^tab\d+$/.test(k) && v) out.push({ who: `163-${k}`, tab: v });
   return out;
 }
