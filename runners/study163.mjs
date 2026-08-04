@@ -160,8 +160,26 @@ async function sessionAlive(t) {
   return r !== 'dead';
 }
 
+// 🔴 163 的播放页是 SPA：**换课时不重新加载页面，JS 堆只涨不落**。
+// 2026-08-04 实测跑了 40 分钟之后，4 个 worker 的堆分别是 1185 / 3765 / 1006 / 1335 MB，
+// 而 Chrome 的堆上限是 4192 MB —— 那个 3765 的马上就要把渲染进程撑爆。
+// 这也是整台 16G 机器反复被顶到"内存压力等级 2"的真正原因（Chrome 单进程能吃到 1.7G）。
+//
+// 解法：换课时之前先看堆，超过阈值就**整页重载**（SPA 内部跳转不释放，必须真 reload）。
+// 代价几乎为零：163 本来就不认断点续播，每个课时都是从 currentTime=0 重新播的。
+const HEAP_MAX_MB = Number(process.env.NC_HEAP_MAX_MB || 900);
+async function recycleIfBloated(t, w) {
+  const mb = Number(await evalJs(t, `(()=>Math.round((performance.memory?performance.memory.usedJSHeapSize:0)/1048576))()`).catch(() => 0));
+  if (!mb || mb < HEAP_MAX_MB) return mb;
+  log(`w${w}   ♻️ JS 堆 ${mb}MB 超过 ${HEAP_MAX_MB}MB，整页重载释放（SPA 换课时不会释放）`);
+  await cdp.navigate(t, 'about:blank').catch(() => { });
+  await sleep(1500);
+  return mb;
+}
+
 async function watch(t, w, cid, ls) {
   log(`w${w} ▶ ${ls.cname ? '《' + ls.cname + '》 ' : ''}课时${ls.idx + 1} ${ls.name} ${ls.info || '(无时长)'}`);
+  await recycleIfBloated(t, w).catch(() => { });
   await cdp.navigate(t, learnUrl(cid, ls.id));
   await sleep(9000);
 
