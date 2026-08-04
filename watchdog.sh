@@ -107,11 +107,12 @@ fi
 #   · vm_stat 的 `Pages free`：**平时就只有几十 MB**（macOS 故意压低，inactive 才是可回收缓存），
 #     拿它做阈值会永远在响 —— 而假警报比没有警报更糟（见 AGENTS.md 第二类）。
 #   · ✅ 用 Apple 自己的 `kern.memorystatus_vm_pressure_level`：1=正常 2=警告 4=危急。
-#     再配一条 swap 已用 ≥90% 兜底（事故当时是 80% 且还在涨）。
+#     swap 百分比**只能当最后兜底**（阈值 97%）：macOS 会动态扩 swap，
+#     所以"已用 92%"经常只是它还没扩容，17 分钟后自己就降到 52% 了 —— 实测误报过一次。
 # 这里只告警不动手：内存紧张时自动去停 runner，风险比收益大（见 AGENTS.md 第三类）。
 LVL=$(sysctl -n kern.memorystatus_vm_pressure_level 2>/dev/null)
 SWAP_PCT=$(sysctl -n vm.swapusage 2>/dev/null | awk '{t=0;u=0; for(i=1;i<=NF;i++){ if($i=="total"){gsub(/M/,"",$(i+2)); t=$(i+2)} if($i=="used"){gsub(/M/,"",$(i+2)); u=$(i+2)} } if(t>0) printf "%d", u*100/t; else print 0}')
-if { [ -n "$LVL" ] && [ "$LVL" -ge 2 ]; } || { [ -n "$SWAP_PCT" ] && [ "$SWAP_PCT" -ge 90 ]; } 2>/dev/null; then
+if { [ -n "$LVL" ] && [ "$LVL" -ge 2 ]; } || { [ -n "$SWAP_PCT" ] && [ "$SWAP_PCT" -ge 97 ]; } 2>/dev/null; then
   MSG="内存压力等级 ${LVL}（1正常/2警告/4危急），swap 已用 ${SWAP_PCT}% —— 再下去 Chrome 主进程会死锁（凌晨那次就是），考虑调小 NC_CONCURRENCY 或关掉别的 App"
   echo "$(ts) 🚨 $MSG" >> logs/ALERT.log
   osascript -e "display notification \"内存压力 ${LVL} / swap ${SWAP_PCT}%，Chrome 有死锁风险\" with title \"继续教育自动学习\"" 2>/dev/null
