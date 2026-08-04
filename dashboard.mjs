@@ -119,8 +119,14 @@ function parseActivity(site, lines) {
   // ⚠️ worker 列表要从日志里**现推**，不能写死。
   //    原来写死成 w0..w5，把并发调到 10 之后多出来的 4 个就静默消失了 ——
   //    而它们其实跑得好好的，只是面板看不见。
-  const ws = [...new Set(L.flatMap(l => l.match(/\bw(\d+)\b/g) || []))]
+  // ⚠️ 但"扫最近 N 行里出现过的 wX"在**并发调小之后是错的**：10 路降到 5 路后，
+  //    日志里还留着 w5~w9 的旧行，面板会一直显示 10 路、其中 5 路永远不更新（踩过）。
+  //    权威值是 runner 每轮打的那行「本轮队列共 N 个课时，M 个 worker 并行」，以它为准。
+  const mConc = last(/本轮队列共 \d+ 个课时，(\d+) 个 worker 并行/);
+  const conc = mConc ? Number(mConc[1]) : 0;
+  let ws = [...new Set(L.flatMap(l => l.match(/\bw(\d+)\b/g) || []))]
     .sort((a, b) => Number(a.slice(1)) - Number(b.slice(1)));
+  if (conc > 0) ws = ws.filter(w => Number(w.slice(1)) < conc);
   const out = [];
   for (const w of ws) {
     const cNew = last(new RegExp(`${w} ▶ 《(.+?)》\\s*(课时\\d+)\\s*(.*)$`));

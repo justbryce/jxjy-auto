@@ -33,8 +33,16 @@ fi
 for s in zjsjczx hzrs study163; do
   log="logs/$s.log"
   if ! pgrep -f "runners/$s.mjs" >/dev/null; then
-    # 正常收工（跑完了）就别再拉起来
-    if [ -f "$log" ] && tail -3 "$log" | grep -q "收工，退出\|所有课程都学完"; then continue; fi
+    # 正常收工（跑完了）就别再拉起来 —— 但**只认 6 小时**。
+    # 🔴 2026-08-04 踩过：hzrs 在登录态失效时把空列表读成"什么都不缺"，打了「收工，退出」，
+    #    而这条规则让看门狗**永远**不再拉它，等于一次误判 = 永久停摆。
+    #    runner 那边已经加了"总学时要求恒为 90，读到 0 就是没读到账号"的守卫，这里再兜一层：
+    #    过了 6 小时无条件重试一次。真学完的话它会立刻再退出，代价可以忽略。
+    if [ -f "$log" ] && tail -3 "$log" | grep -q "收工，退出\|所有课程都学完"; then
+      quit_age=$(( ( $(date +%s) - $(stat -f %m "$log") ) / 3600 ))
+      if [ "$quit_age" -lt 6 ]; then continue; fi
+      echo "$(ts) $s 已收工 ${quit_age} 小时，复查一次（防止是误判的收工）" >> "$WLOG"
+    fi
     echo "$(ts) $s 不在运行，拉起" >> "$WLOG"
     ./start.sh "$s" >> "$WLOG" 2>&1
     continue
