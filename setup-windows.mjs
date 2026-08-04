@@ -133,13 +133,17 @@ if (zjSameScreen && lastRight >= SCREEN_X0 + SCREEN_W - 40)
   log(`⚠ 最后一个 163 窗口右边缘 ${lastRight} 快贴到屏幕右边 ${SCREEN_X0 + SCREEN_W} 了，zj 可能被完全盖住`);
 if (!zjSameScreen) log(`zj 单独摆在 x=${ZJ_X}（和 163 那一串不在同一块屏）`);
 
+// 停用的站不给它建窗口 —— 视频窗口是这台机器上最贵的资源（内存），别为不跑的站留着。
+const disabled = k => fs.existsSync(path.join(HERE, 'state', `DISABLED-${k}`));
+
 const PLAN = [
-  { key: 'zj', file: 'zjsjczx.json', field: 'target', bounds: [ZJ_X, WIN_TOP, ZJ_X + CW_WIDE, WIN_BOT], url: 'https://engineer.zjsjczx.org.cn/zg/student/learning-center' },
+  ...(disabled('zjsjczx') ? [] : [{ key: 'zj', file: 'zjsjczx.json', field: 'target', bounds: [ZJ_X, WIN_TOP, ZJ_X + CW_WIDE, WIN_BOT], url: 'https://engineer.zjsjczx.org.cn/zg/student/learning-center' }]),
   ...Array.from({ length: W }, (_, i) => ({
     key: `163-w${i}`, file: 'study163.json', field: `tab${i}`, bounds: col(i),
     url: 'https://study.163.com/my#/courses',
   })),
 ];
+if (disabled('zjsjczx')) log('浙江工信已停用（state/DISABLED-zjsjczx），不给它建窗口');
 
 // 多行 AppleScript 用 -e 逐行传，别塞进一个字符串（osascript 会报语法错）
 // ⚠️ 超时给足。原来给 15s，在「6 路视频正在播」的时候 Chrome 建一个窗口就能超 ——

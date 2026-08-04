@@ -73,7 +73,15 @@ fi
 
 SITES=("$@")
 [ ${#SITES[@]} -eq 0 ] && SITES=(zjsjczx hzrs study163)
-for s in "${SITES[@]}"; do start "$s"; done
+# 单站停用开关：state/DISABLED-<站名>。用来"这个平台的目标已经达成了，别再刷了"。
+# （watchdog.sh 也认这个文件，否则它 5 分钟就把停掉的站拉回来。）
+for s in "${SITES[@]}"; do
+  if [ -f "state/DISABLED-$s" ]; then
+    echo "· $s 已停用（state/DISABLED-$s，删掉该文件即可恢复）"
+    continue
+  fi
+  start "$s"
+done
 echo
 echo "看日志： tail -f $(pwd)/logs/<站点>.log"
 echo "看状态： $(pwd)/status.sh"

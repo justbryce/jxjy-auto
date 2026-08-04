@@ -32,6 +32,8 @@ fi
 
 for s in zjsjczx hzrs study163; do
   log="logs/$s.log"
+  # 单站停用开关（见 start.sh）。不加这个的话，人手动停掉的站 5 分钟就被拉回来。
+  [ -f "state/DISABLED-$s" ] && continue
   if ! pgrep -f "runners/$s.mjs" >/dev/null; then
     # 正常收工（跑完了）就别再拉起来 —— 但**只认 6 小时**。
     # 🔴 2026-08-04 踩过：hzrs 在登录态失效时把空列表读成"什么都不缺"，打了「收工，退出」，
