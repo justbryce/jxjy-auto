@@ -112,8 +112,24 @@ fi
 # 这里只告警不动手：内存紧张时自动去停 runner，风险比收益大（见 AGENTS.md 第三类）。
 LVL=$(sysctl -n kern.memorystatus_vm_pressure_level 2>/dev/null)
 SWAP_PCT=$(sysctl -n vm.swapusage 2>/dev/null | awk '{t=0;u=0; for(i=1;i<=NF;i++){ if($i=="total"){gsub(/M/,"",$(i+2)); t=$(i+2)} if($i=="used"){gsub(/M/,"",$(i+2)); u=$(i+2)} } if(t>0) printf "%d", u*100/t; else print 0}')
-if { [ -n "$LVL" ] && [ "$LVL" -ge 2 ]; } || { [ -n "$SWAP_PCT" ] && [ "$SWAP_PCT" -ge 97 ]; } 2>/dev/null; then
-  MSG="内存压力等级 ${LVL}（1正常/2警告/4危急），swap 已用 ${SWAP_PCT}% —— 再下去 Chrome 主进程会死锁（凌晨那次就是），考虑调小 NC_CONCURRENCY 或关掉别的 App"
-  echo "$(ts) 🚨 $MSG" >> logs/ALERT.log
-  osascript -e "display notification \"内存压力 ${LVL} / swap ${SWAP_PCT}%，Chrome 有死锁风险\" with title \"继续教育自动学习\"" 2>/dev/null
+# ⚠️ 等级 2（warning）在这台 16G 机器上是**常态**，每 5 分钟报一次就成噪音了。
+#    分档：等级 4（critical）立刻报；等级 2 要**连续 3 次（15 分钟）**才报，且每小时最多一次。
+MEMSTATE=state/mem.streak
+STREAK=$(cat "$MEMSTATE" 2>/dev/null || echo 0)
+if [ -n "$LVL" ] && [ "$LVL" -ge 2 ] 2>/dev/null; then STREAK=$((STREAK+1)); else STREAK=0; fi
+echo "$STREAK" > "$MEMSTATE"
+FIRE=0
+[ -n "$LVL" ] && [ "$LVL" -ge 4 ] 2>/dev/null && FIRE=1                       # 危急：立刻
+[ "$STREAK" -ge 3 ] && FIRE=1                                                  # 警告持续 15 分钟
+[ -n "$SWAP_PCT" ] && [ "$SWAP_PCT" -ge 97 ] 2>/dev/null && FIRE=1             # swap 见底兜底
+if [ "$FIRE" = 1 ]; then
+  LASTF=state/mem.lastalert
+  LAST=$(cat "$LASTF" 2>/dev/null || echo 0)
+  NOW=$(date +%s)
+  if [ "$LVL" -ge 4 ] 2>/dev/null || [ $((NOW-LAST)) -ge 3600 ]; then
+    echo "$NOW" > "$LASTF"
+    MSG="内存压力等级 ${LVL}（已持续 ${STREAK} 轮 ≈ $((STREAK*5)) 分钟），swap 已用 ${SWAP_PCT}% —— 再下去 Chrome 主进程会死锁（8/4 凌晨那次就是），考虑调小 NC_CONCURRENCY 或关掉别的 App"
+    echo "$(ts) 🚨 $MSG" >> logs/ALERT.log
+    osascript -e "display notification \"内存压力 ${LVL} 持续 $((STREAK*5)) 分钟 / swap ${SWAP_PCT}%\" with title \"继续教育自动学习\"" 2>/dev/null
+  fi
 fi
