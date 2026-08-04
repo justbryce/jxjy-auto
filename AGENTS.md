@@ -42,7 +42,9 @@ README 面向人，讲的是"这是什么"；这份讲的是"你该怎么动手�
 | "卡住了 / 没在动" | 走下面「排错决策树」 |
 | "加一个新平台" | 抄 `runners/` 里最像的那个；README 末尾有三个必答问题 |
 | "调快一点" | 先量再改：`node progress-check.mjs` 看真实产出，别凭日志判断。见「性能」 |
-| "学时怎么没涨" | 新干线要 `node recalc.mjs` 手动结算（平台限 3 次/天）；其他站是实时的 |
+| "学时怎么没涨" | 新干线要 `node recalc.mjs` 手动结算（平台限 3 次/天）；其他站是实时的。<br>⚠️ recalc 报「后台页面进不去」＝ localStorage 的 `use_info` 被清了（axios 拦截器收到 `status==-1` 就删），**cookie 还有效、课照学**，只能让用户重新点一次「学员登录」 |
+| "内存爆了 / Chrome 卡死" | 先看 `kern.memorystatus_vm_pressure_level`（**别看 Chrome 内存绝对值，5~7G 起伏正常**）。<br>再查 163 各 tab 的 `performance.memory.usedJSHeapSize` —— SPA 泄漏堆是主因，见第四类 |
+| "停掉某个平台" | `touch state/DISABLED-<站名>`（start/watchdog/setup-windows/heal/progress-check 五处都认），`rm` 恢复 |
 
 ---
 
@@ -134,6 +136,18 @@ macOS 弹「应用程序内存不足」，**Chrome 浏览器主进程死锁**，
 
 **改调度之前先把它换算成"单位时间的资源动作数"**（开关 tab、导航、新建进程、并发缓冲），
 而不只是看"每小时完成多少个"。一个纯赢的吞吐改动，可能是资源消耗的数量级增长。
+
+🔴 **但后来发现降并发只是治标 —— 真凶是 163 的 SPA 泄漏 JS 堆。**
+播放页是 SPA，换课时不重新加载，`usedJSHeapSize` 只涨不落：实测 40 分钟后
+4 个 worker 是 1185 / **3765** / 1006 / 1335 MB，而 Chrome 堆上限 4192 ——
+那个 3765 的 tab 已经完全无响应，渲染进程单独吃 1.7G 物理内存。
+现在换课时前先读堆，超 `NC_HEAP_MAX_MB`（默认 900）就整页重载
+（**SPA 内部跳转不释放，必须真 navigate 一次 `about:blank`**），日志里是「♻️」。
+修完并发从 3 一路加回 6，压力稳定在等级 1。
+
+**通用教训：长时间跑的"每轮换一个目标"的循环，都要问一句——这一轮的内存还回去了吗？
+SPA 尤其危险，它看起来"换页了"，实际上从没卸载过。**
+另外**别用 Chrome 内存的绝对值做判据**（会自己涨落），用 `kern.memorystatus_vm_pressure_level`。
 
 Chrome 主进程死锁的辨认特征（很有用，别再花两小时重查）：
 
