@@ -63,11 +63,15 @@ async function snapshot() {
 // 假警报比没有警报更糟：它把真出事时的那一条淹掉了。
 // 现在改看 `data.study` 里「总学时」的 s（权威值），代价是它只在「学时重算」之后才跳
 // （recalc.sh 每天 8:05 / 20:05 各跑一次，平台限 3 次/天），所以窗口给到 12 小时。
+// 停用的站（state/DISABLED-<站名>）不参与告警 —— 它本来就不该涨。
+// 不加这个的话，人主动停掉一个站之后，90 分钟就开始刷"没涨"的假警报。
+const disabled = k => fs.existsSync(path.join(HERE, 'state', `DISABLED-${k}`));
+
 const METRICS = [
-  ['zj', '浙江工信学时', STALE_MIN],
-  ['hz', '新干线总学时', 12 * 60],
-  ['nc', '网易云已完成课时', STALE_MIN],
-];
+  ['zj', '浙江工信学时', STALE_MIN, 'zjsjczx'],
+  ['hz', '新干线总学时', 12 * 60, 'hzrs'],
+  ['nc', '网易云已完成课时', STALE_MIN, 'study163'],
+].filter(m => !disabled(m[3]));
 
 const now = Date.now();
 const cur = await snapshot();
@@ -89,7 +93,7 @@ if (!hist.find(x => now - x.t >= STALE_MIN * 60_000)) {
 }
 
 if (stalled.length === METRICS.length) {
-  const msg = `三个平台产出都没涨，多半是空转了`;
+  const msg = `在跑的 ${METRICS.length} 个平台产出都没涨，多半是空转了`;
   log('🚨', msg);
   fs.appendFileSync(path.join(HERE, 'logs/ALERT.log'), `${new Date().toLocaleString('zh-CN')} 🚨 ${msg}\n`);
   try { execSync(`osascript -e 'display notification "${msg}" with title "继续教育自动学习"'`); } catch { }
