@@ -152,8 +152,12 @@ async function popupText(t) {
 // 队列里还有一批 fails=3 待宰 —— 又一次"拿环境故障给课程判死刑"（AGENTS 第一类，这是第四次）。
 // 这个信号是**可以分开**的：错误文案里明确带 code 和"无法播放"，直播/非视频课时不会这样。
 async function playerError(t) {
-  return evalJs(t, `(()=>{const x=(document.body.innerText||"");
-    const m=x.match(/[^\n]{0,40}(?:无法播放|播放失败)[^\n]{0,40}/);
+  // ⚠️ 这里**绝对不能**在正则里写 `[^\n]`：本函数体是模板字符串，`\n` 会被外层 JS
+  //    先解析成真正的换行符，正则字面量一断行就是 `SyntaxError: missing /`，
+  //    而下面的 .catch 会把它静默吞成空字符串 —— 探测器看起来在跑，其实永远返回"没错误"。
+  //    用 `.` 就好：它本来就不匹配换行，语义完全一样且没有转义陷阱。（踩过，白修一轮。）
+  return evalJs(t, `(()=>{const x=((document.body||{}).innerText)||"";
+    const m=x.match(/.{0,40}(?:无法播放|播放失败).{0,40}/);
     return m?m[0].trim().slice(0,80):""})()`).catch(() => '');
 }
 
@@ -180,6 +184,13 @@ async function sessionAlive(t) {
 //
 // 解法：换课时之前先看堆，超过阈值就**整页重载**（SPA 内部跳转不释放，必须真 reload）。
 // 代价几乎为零：163 本来就不认断点续播，每个课时都是从 currentTime=0 重新播的。
+// 本进程内的软跳过：撞过 code:10 那类平台侧错误的课时，本轮运行先绕开。
+// **刻意不落盘** —— 平台错误是会自己好的，重启即失效，绝不变成永久判决
+// （抄 zjsjczx.mjs 的 softSkip，AGENTS 第一类第 3 条推荐的正是这个形态）。
+// 不加这个的话：队列按短课时优先排序，坏课时每轮都排最前，
+// 两个 worker 每轮白耗 ~2 分钟在同一批必然失败的课时上。
+const softBad = new Set();
+
 const HEAP_MAX_MB = Number(process.env.NC_HEAP_MAX_MB || 900);
 async function recycleIfBloated(t, w) {
   const mb = Number(await evalJs(t, `(()=>Math.round((performance.memory?performance.memory.usedJSHeapSize:0)/1048576))()`).catch(() => 0));
@@ -238,12 +249,34 @@ async function watch(t, w, cid, ls) {
     // 先排除"平台不给播"。这一路**绝不能**记失败计数 —— 平台一抽风，队列会被成批判死。
     const perr = await playerError(t);
     if (perr) {
-      log(`w${w}   ⏸ 平台侧播放错误「${perr}」—— 这不是课时的问题，本课时放回队列，歇 60 秒`);
+      softBad.add(ls.id);
+      log(`w${w}   ⏸ 平台侧播放错误「${perr}」—— 这不是课时的问题，本次运行内先绕开（不落盘，重启即重试），歇 60 秒`);
       await sleep(60_000);
       return 'env';        // 上层不计入失败次数，且把任务原样放回去
     }
+    // 🔴 **页面里压根没有 <video> ≠ 这个课时不是视频。**
+    // 163 是 SPA：tab 一旦 hidden，Chrome 密集节流会让它连播放器都挂载不出来
+    // （AGENTS 第四类/lib/display.mjs 都记过）。此时**每一个**课时都会"起播失败"，
+    // 照常记失败计数的话，三轮就把队列成批判死 —— 这正是 2026-08-21 误杀 4 个正常课时的那条路。
+    // zjsjczx.mjs 早就把 `{none:true}` 单独分出来"重建 tab 重试、绝不拉黑"了，这份一直没跟上。
+    //
+    // 判据现成的：**目录里带 mm:ss 时长的就是视频课时**（没时长的才是作业/考试/资料，
+    // 那些本来就没有 <video>，见 secsOf 的 NO_DUR）。
+    // 有时长却挂不出播放器 → 一定是环境，不是课时。
+    if ((!s || s.none) && /\d+:\d+/.test(String(ls.info || ''))) {
+      const vis = await evalJs(t, 'document.visibilityState').catch(() => '?');
+      log(`w${w}   ⏸ 页面里没有 <video>，但目录写着 ${ls.info}（是视频课时）—— 环境问题不是课时问题`);
+      log(`w${w}      tab 当前 ${vis}${vis === 'hidden' ? '（被盖住了，SPA 在被节流的页面里挂不出播放器）' : ''}，放回队列，歇 45 秒`);
+      // 🔑 光恢复可见性救不回来：实测 tab 已经是 visible 了，SPA 照样挂不出 <video> ——
+      //    那个文档实例已经卡死（多半是在 hidden 期间被节流掐断了初始化）。
+      //    SPA 内部换课时不会重建，必须真 navigate 一次 about:blank 把文档扔掉，
+      //    下一轮 learnUrl 才是一次完整的整页加载。和 recycleIfBloated 是同一个道理。
+      await cdp.navigate(t, 'about:blank').catch(() => { });
+      await sleep(45_000);
+      return 'env';        // 不计失败次数，课时放回队列
+    }
     const pu = await popupText(t);
-    log(`w${w}   起播失败${pu ? ' 弹窗:' + pu.slice(0, 100) : ''}（多半是直播/非视频课时）`);
+    log(`w${w}   起播失败${pu ? ' 弹窗:' + pu.slice(0, 100) : ''}（无时长，多半是直播/作业/非视频课时）`);
     return 'skip';
   }
 
@@ -359,6 +392,13 @@ function isOurTab(id) {
 
 // 读某门课的课时目录。必须整页加载课程页 —— watch() 用过的页面上，课时状态是"开播之前"的旧快照。
 async function lessonsOf(t, cid) {
+  // 🔴 必须先真的把文档扔掉再加载课程页。
+  //    从 `courseLearn.htm?courseId=X#/learn/video?lessonId=…` 导航到 `courseLearn.htm?courseId=X`
+  //    只是去掉 hash —— 那是**同文档导航**，SPA 根本不重新加载，读到的目录还是开播前那份快照。
+  //    2026-08-21 实测：接口说「已完成 16」，而目录 DOM 里只有 10 —— 差着 6 个，
+  //    于是那 6 个已经学完的课时被反复重新排进队列、反复重播（AGENTS 第二类第 2 条）。
+  await cdp.navigate(t, 'about:blank').catch(() => { });
+  await sleep(1500);
   await cdp.navigate(t, learnUrl(cid));
   await sleep(9000);
   for (let i = 0; i < 8; i++) {
@@ -381,7 +421,7 @@ async function buildQueue(t, courses) {
     // 所以只是本轮跳过、下一轮还会重试，不要落盘成永久跳过。
     if (!all.length) { log(`  读不到《${c.name}》的课时列表（页面没渲染出来？登录态？），本轮跳过，下轮重试`); continue; }
     const skipped = state.data.skipped[c.id] || [];
-    const todo = all.filter(x => x.st !== '已完成' && !skipped.includes(x.id));
+    const todo = all.filter(x => x.st !== '已完成' && !skipped.includes(x.id) && !softBad.has(x.id));
     log(`  《${c.name}》 ${all.length} 课时，已完成 ${all.filter(x => x.st === '已完成').length}，跳过 ${skipped.length}，待学 ${todo.length}`);
     for (const ls of todo) q.push({ cid: c.id, cname: c.name, ...ls });
   }
@@ -448,6 +488,7 @@ async function loop() {
     while (true) {
       const task = queue[next++];
       if (!task) return;
+      if (softBad.has(task.id)) continue;   // 本轮队列建好之后才被标记的，这里再挡一道
       if (!await sessionAlive(t)) {
         log(`w${w} ❌ 登录态失效，停止本轮（请重新登录 study.163.com）`);
         await pauseAll();
@@ -455,7 +496,13 @@ async function loop() {
       }
       try {
         const r = await watch(t, w, task.cid, task);
-        if (r === 'env') { next--; continue; }   // 环境问题，这个课时原样放回去重试，不计失败
+        // 环境问题：把课时放回队列重试，不计失败次数。
+        // ⚠️ **不能写成 `next--`** —— 那退的是全局游标，不是本 worker 手里那一格：
+        //    w0 拿了 5（next=6），w1 拿了 6（next=7），w0 退一格 next=6，
+        //    下一轮 w0 又拿到 6 —— 和 w1 撞车，两个 worker 同时播同一个课时。
+        //    ('env' 原来只在显示器休眠时触发、全员一起睡 300 秒，所以从没暴露。)
+        //    追加到队尾既避开索引竞争，语义也更对：环境问题就该等别的都试过再回来。
+        if (r === 'env') { queue.push(task); continue; }
         if (r === 'skip' || r === 'timeout') {
           // 🔴 **不要凭一次失败就永久跳过。**
           // skip/timeout 里混着两种完全不同的事：

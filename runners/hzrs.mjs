@@ -17,6 +17,7 @@
 
 import * as cdp from '../lib/cdp.mjs';
 import { sleep, evalJs, evalJson } from '../lib/cdp.mjs';
+import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -165,7 +166,31 @@ async function openClass(courseId) {
   // Chrome 常把新 tab 扔进一个位置随机的新窗口，容易压住 163 那两个必须保持可见的小窗口。
   // 本站不需要可见（学时按页面墙钟计），挪到屏幕下方停着。
   cdp.parkWindow('#/class?courseId=', [0, 620, 700, 1060]);
+  await restoreDedicatedTabs();
   return r.targetId;
+}
+
+// 🔴 新建 tab 会被 Chrome 塞进**最后获得焦点的那个窗口** —— 那很可能正是 163 的专用窗口。
+// 一进去它就成了那个窗口的**活动 tab**，163 自己的 tab 退居后台变 hidden，
+// 而 163 是 SPA：hidden 页被密集节流后**连 <video> 元素都挂载不出来**，
+// 于是那个 worker 每个课时都"起播失败"，失败计数一路烧。
+// 2026-08-21 实测：163-w1 的窗口被 class tab 占了活动位，6 分钟烧掉 8 个课时的计数。
+// ⚠️ parkWindow 救不了这种情况 —— 它只认"整窗只有 1 个 tab"，而这时候那窗口有 2 个。
+//
+// 本站不需要可见（学时按页面墙钟计，parkWindow 本来就是把它挪到屏幕角落），
+// 所以开完课就把别人的专用 tab 重新设回各自窗口的活动 tab。让出去不花我们一分钱。
+async function restoreDedicatedTabs() {
+  for (const f of ['study163.json', 'zjsjczx.json']) {
+    let d;
+    try { d = JSON.parse(fs.readFileSync(path.join(HERE, '../state/' + f), 'utf8')); } catch { continue; }
+    for (const [k, v] of Object.entries(d)) {
+      if (!/^(tab\d+|target)$/.test(k) || typeof v !== 'string') continue;
+      if (await cdp.tabAlive(v)) {
+        await cdp.front(v).catch(() => { });
+        log(`  把 ${f.replace('.json', '')} 的专用 tab 设回其窗口的活动 tab（本站不需要可见）`);
+      }
+    }
+  }
 }
 
 // 页面里装个钩子，抓 updateStudy 的 playTime / finish，用来判断"计时到底有没有在走"
