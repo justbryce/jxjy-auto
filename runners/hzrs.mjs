@@ -141,16 +141,26 @@ async function crossGap() {
 }
 
 // ---- 别人在学吗 ----
+// 🔴 判据不能只看 `state.data.cls`（当前这一门）。runner 被 pkill/自愈重启时，
+//    上一代开的 class tab 还留在 Chrome 里，而 state 里的 cls 可能是更早的、已经死掉的 id
+//    （两代进程重叠时 state.save() 是最后写的赢）。于是**它把自己的孤儿 tab 当成了"用户本人在学"**，
+//    每 5 分钟让一次路、永远让下去 —— 进程活着、日志在滚、学时零增长。
+//    2026-08-21 实测：连着让路 10 分钟以上，且没有任何机制能自己走出来。
+//    所以按 163 的做法记下**我们开过的所有 class tab**，只有不在这个集合里的才算别人的。
 async function foreignClassTab(mine) {
+  const owned = new Set([mine, ...(state.data.owned || [])].filter(Boolean));
   const ts = await cdp.findTabs(t => t.url.includes('learning.hzrs.hangzhou.gov.cn/#/class'));
-  return ts.find(t => t.targetId !== mine) || null;
+  return ts.find(t => !owned.has(t.targetId)) || null;
 }
 
 // ---- 播课 ----
 async function openClass(courseId) {
   if (state.data.cls && await cdp.tabAlive(state.data.cls)) await cdp.closeTab(state.data.cls);
   const r = await cdp.newTab(`${ORIGIN}/#/class?courseId=${courseId}`);
-  state.data.cls = r.targetId; state.save();
+  state.data.cls = r.targetId;
+  // 记账用来区分"我们的 tab"和"用户自己开的"（见 foreignClassTab）。只留最近 20 个，别无限涨。
+  state.data.owned = [...(state.data.owned || []), r.targetId].slice(-20);
+  state.save();
   await sleep(7000);
   // Chrome 常把新 tab 扔进一个位置随机的新窗口，容易压住 163 那两个必须保持可见的小窗口。
   // 本站不需要可见（学时按页面墙钟计），挪到屏幕下方停着。

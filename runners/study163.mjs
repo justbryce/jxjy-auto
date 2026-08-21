@@ -403,6 +403,18 @@ async function loop() {
 
   const courses = res.list.filter(c => c.fin < c.units);
   log(`我的学习：${res.list.length} 门课，未学完 ${courses.length} 门，共 ${res.list.reduce((a, b) => a + b.units, 0)} 课时（已完成 ${res.list.reduce((a, b) => a + b.fin, 0)}）`);
+  // 🔴 「一门课都没返回」≠「学完了」。真学完的话列表里**还会有那些已完成的课**，
+  //    条数不会是 0。返回空列表只有一个解释：这个账号根本没读到
+  //    （登录态掉了但没回 not_auth、Chrome 里换了账号、页面没加载好）。
+  //    照 'finished' 走的话 main() 会直接 return，**进程退出**；而 watchdog.sh 见到
+  //    「所有课程都学完」6 小时内不再拉起 —— 一次误判 = 半天停摆。
+  //    hzrs 早就为完全同样的问题加了守卫（"总学时要求恒为 90，读到 0 就是没读到账号"），
+  //    这里补上对应的那道。2026-08-21 实测到本站就是这么退的。
+  if (!res.list.length) {
+    log('❌ 课程列表一门都没返回 —— 这不是"学完了"，多半是登录态/页面问题。请确认 Chrome 里 study.163.com 是登录状态，10 分钟后重试');
+    await sleep(600_000);
+    return;
+  }
   if (!courses.length) return 'finished';
 
   courses.sort((a, b) => (a.units - a.fin) - (b.units - b.fin));   // 小课先清掉

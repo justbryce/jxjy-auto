@@ -140,7 +140,11 @@ http.createServer(async (req, res) => {
   const u = new URL(req.url, 'http://x');
   const p = u.pathname, q = u.searchParams, t = q.get('target');
   try {
-    if (p === '/health') return json(res, 200, { ok: true, chromePort });
+    // connected 是**连着 Chrome 吗**，不是"代理进程活着吗" —— 两者差别很大：
+    // 代理活着但 WebSocket 断了（Chrome 重启 / 授权弹窗没人点）时，三个 runner 只会一直
+    // 空转 timeout，而 ok:true 完全看不出来。watchdog.sh 和 resume-after-consent.sh 都靠它。
+    // ⚠️ 这里刻意放在 `await connect()` 之前 —— 探活不能触发连接，否则每次查健康都新弹一个授权框。
+    if (p === '/health') return json(res, 200, { ok: true, connected: !!(ws && ws.readyState === 1), chromePort });
     await connect();
 
     if (p === '/targets') {
