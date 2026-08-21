@@ -144,6 +144,19 @@ async function popupText(t) {
     return [...new Set(out)].join(" | ").slice(0,300)})()`).catch(() => '');
 }
 
+// 🔴 平台侧的播放错误 —— 「抱歉视频无法播放[code:10]，您可以尝试刷新页面」这一类。
+// 这是**环境问题**（CDN 抽风 / 平台限流 / 频繁重开同一门课招来的风控），
+// 和"这个课时压根不是视频"是完全不同的两件事，但它们在 watch() 里返回值一模一样，
+// 于是全都记进连续失败计数、烧到 3 次就永久拉黑。
+// 2026-08-21 实测：连着重启三次之后触发 code:10，**80 秒内永久拉黑了 4 个完全正常的课时**，
+// 队列里还有一批 fails=3 待宰 —— 又一次"拿环境故障给课程判死刑"（AGENTS 第一类，这是第四次）。
+// 这个信号是**可以分开**的：错误文案里明确带 code 和"无法播放"，直播/非视频课时不会这样。
+async function playerError(t) {
+  return evalJs(t, `(()=>{const x=(document.body.innerText||"");
+    const m=x.match(/[^\n]{0,40}(?:无法播放|播放失败)[^\n]{0,40}/);
+    return m?m[0].trim().slice(0,80):""})()`).catch(() => '');
+}
+
 // 播放途中会话也可能失效（同一账号在别处登录、并发流太多被判异常……）。
 // ⚠️ 别用手工构造的 DWR 请求来探活：`httpSessionId` 我们拿不到，服务端**无论登没登录**
 //    都会回 SecurityException，是个 100% 的假阳性（踩过）。
@@ -221,6 +234,13 @@ async function watch(t, w, cid, ls) {
       log(`w${w}   ⏸ 显示器休眠，页面被节流到播放器都挂载不出来 —— 这不是课时的问题，等 5 分钟再说`);
       await sleep(300_000);
       return 'env';        // 上层不会把 'env' 计入失败次数
+    }
+    // 先排除"平台不给播"。这一路**绝不能**记失败计数 —— 平台一抽风，队列会被成批判死。
+    const perr = await playerError(t);
+    if (perr) {
+      log(`w${w}   ⏸ 平台侧播放错误「${perr}」—— 这不是课时的问题，本课时放回队列，歇 60 秒`);
+      await sleep(60_000);
+      return 'env';        // 上层不计入失败次数，且把任务原样放回去
     }
     const pu = await popupText(t);
     log(`w${w}   起播失败${pu ? ' 弹窗:' + pu.slice(0, 100) : ''}（多半是直播/非视频课时）`);
