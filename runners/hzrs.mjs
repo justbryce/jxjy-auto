@@ -165,8 +165,14 @@ async function openClass(courseId) {
   if (state.data.cls && await cdp.tabAlive(state.data.cls)) await cdp.closeTab(state.data.cls);
   const r = await cdp.newTab(`${ORIGIN}/#/class?courseId=${courseId}`);
   state.data.cls = r.targetId;
-  // 记账用来区分"我们的 tab"和"用户自己开的"（见 foreignClassTab）。只留最近 20 个，别无限涨。
-  state.data.owned = [...(state.data.owned || []), r.targetId].slice(-20);
+  // 记账用来区分"我们的 tab"和"用户自己开的"（见 foreignClassTab）。
+  // ⚠️ 淘汰依据只能是"它还活着吗"，**不能按数量截断** —— 一个 tab 能活多久，
+  //    跟"这之后又开了几门课"毫无关系。2026-08-25 踩过：一个 8/21 09:40 开的 class tab
+  //    活了 4 天，被原来的 slice(-20) 挤出记账后，runner 把**自己的**孤儿认成了用户本人，
+  //    每 5 分钟让路一次、永远走不出来（第二类第 9 条：进程活着、日志在滚、学时零增长）。
+  //    按存活过滤同样不会无限涨 —— 上限就是 Chrome 里实际还开着的 tab 数。
+  const live = new Set((await cdp.findTabs(() => true)).map(t => t.targetId));
+  state.data.owned = [...(state.data.owned || []).filter(id => live.has(id)), r.targetId];
   state.save();
   await sleep(7000);
   // Chrome 常把新 tab 扔进一个位置随机的新窗口，容易压住 163 那两个必须保持可见的小窗口。
