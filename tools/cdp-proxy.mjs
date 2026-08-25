@@ -24,7 +24,7 @@ const PORT = Number(process.env.PORT || 3456);
 const CANDIDATE_PORTS = [Number(process.env.CHROME_PORT) || 9222, 9229, 9333].filter(Boolean);
 
 // ---------- 连接 Chrome ----------
-let ws = null, chromePort = null;
+let ws = null, chromePort = null, connecting = null;
 let msgId = 0;
 const pending = new Map();            // id -> resolve
 const sessions = new Map();           // targetId -> sessionId
@@ -39,32 +39,55 @@ const probe = port => new Promise(res => {
 
 async function connect() {
   if (ws && ws.readyState === 1) return;
+  if (!connecting) connecting = connectOnce().finally(() => { connecting = null; });
+  return connecting;
+}
+
+async function connectOnce() {
+  if (ws && ws.readyState === 1) return;
   if (!chromePort) {
     for (const p of CANDIDATE_PORTS) if (await probe(p)) { chromePort = p; break; }
     if (!chromePort) throw new Error(`没找到 Chrome 调试端口（试过 ${CANDIDATE_PORTS.join(', ')}）。见本文件顶部注释。`);
   }
-  // 两种 Chrome 的 browser 端点不一样：
-  //  · 命令行 --remote-debugging-port 起的：HTTP /json/version 里有带 UUID 的 webSocketDebuggerUrl，必须用它
-  //  · 在 chrome://inspect 里勾选 "Allow remote debugging" 的日常 Chrome：HTTP 端点是关的，
-  //    但 ws://127.0.0.1:PORT/devtools/browser 这个无 UUID 的路径可用
-  let wsUrl = `ws://127.0.0.1:${chromePort}/devtools/browser`;
+  // 日常 Chrome 的 HTTP 调试端点是关的，访问 /json/version 也可能触发一次授权框；
+  // 所以先直接连无 UUID 的 browser 路径。只有它明确失败时，才为命令行启动的 Chrome
+  // 回退到 /json/version 中带 UUID 的 webSocketDebuggerUrl。
+  const directUrl = `ws://127.0.0.1:${chromePort}/devtools/browser`;
   try {
+    await openSocket(directUrl);
+    return;
+  } catch (directError) {
+    let fallbackUrl;
+    try {
     const v = await (await fetch(`http://127.0.0.1:${chromePort}/json/version`,
       { signal: AbortSignal.timeout(2000) })).json();
-    if (v.webSocketDebuggerUrl) wsUrl = v.webSocketDebuggerUrl;
-  } catch { /* HTTP 端点关着，用上面那个默认路径 */ }
+      fallbackUrl = v.webSocketDebuggerUrl;
+    } catch { }
+    if (!fallbackUrl || fallbackUrl === directUrl) throw directError;
+    await openSocket(fallbackUrl);
+  }
+}
 
-  await new Promise((resolve, reject) => {
-    ws = new WebSocket(wsUrl);
-    const to = setTimeout(() => reject(new Error('连接 Chrome 超时')), 8000);
-    ws.onopen = () => { clearTimeout(to); console.log(`[cdp-proxy] 已连接 Chrome :${chromePort} (${wsUrl})`); resolve(); };
-    ws.onerror = e => {
-      clearTimeout(to);
+function openSocket(wsUrl) {
+  return new Promise((resolve, reject) => {
+    const socket = new WebSocket(wsUrl);
+    let opened = false;
+    ws = socket;
+    socket.onopen = () => {
+      opened = true;
+      console.log(`[cdp-proxy] 已连接 Chrome :${chromePort} (${wsUrl})`);
+      resolve();
+    };
+    socket.onerror = e => {
       reject(new Error('连接 Chrome 失败: ' + (e.message || e.error?.message || 'error') +
         '。常见原因：Chrome 同一时间只允许一个 /devtools/browser 调试连接，已经有别的工具连着了。'));
     };
-    ws.onclose = () => { ws = null; sessions.clear(); };
-    ws.onmessage = ev => {
+    socket.onclose = () => {
+      if (ws === socket) ws = null;
+      sessions.clear();
+      if (!opened) reject(new Error('Chrome 在远程调试授权完成前关闭了连接'));
+    };
+    socket.onmessage = ev => {
       let m; try { m = JSON.parse(ev.data); } catch { return; }
       if (m.id && pending.has(m.id)) { pending.get(m.id)(m); pending.delete(m.id); }
     };
