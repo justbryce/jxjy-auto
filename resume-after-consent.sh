@@ -17,11 +17,14 @@ LOG "开始等待 Chrome 远程调试授权（每 2 分钟探一次，最多等 
 # ⚠️ 别探太勤：**每次连接尝试都会新弹一个授权框**，堆一叠上去，人点掉一个后面还有一个，
 # 看起来像"点了没用"。2 分钟一次足够，且保证对话框始终有一个在。
 for i in $(seq 1 360); do
-  curl -s --max-time 15 http://localhost:3456/targets -o /dev/null 2>/dev/null
-  H=$(curl -s --max-time 10 http://localhost:3456/health 2>/dev/null)
-  case "$H" in
-    *'"connected":true'*)
-      LOG "✅ CDP 通了：$H"
+  # 判据用 /targets 的**真实返回值**，不用 /health 的 connected 字段：
+  # 这一次调用本来就是用来把授权弹窗顶出来的，顺手拿它的结果最准 ——
+  # 返回 JSON 数组（'['开头）就证明 WebSocket 真的通了、能列出 tab。
+  # 而 /health 在老版本代理里没有 connected 字段，靠它会**永远等不到**，白等 12 小时。
+  T=$(curl -s --max-time 15 http://localhost:3456/targets 2>/dev/null)
+  case "$T" in
+    '['*)
+      LOG "✅ CDP 通了（/targets 返回了 tab 列表）"
       LOG "清掉暂停标记，重建窗口布局……"
       rm -f state/PAUSED
       # shellcheck disable=SC1091

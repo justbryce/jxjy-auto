@@ -80,6 +80,14 @@ function recentRate() {
   } catch { return null; }
 }
 
+// runner 进程在不在。用 pgrep 而不是读 PID 文件 —— runner 没有 PID 文件，
+// 而 start.sh / watchdog.sh 判断"要不要拉起"用的也正是这个同款匹配，保持一致。
+// 没匹配到时 pgrep 退出码是 1，execFileSync 会抛，catch 成 false。
+function running(name) {
+  try { execFileSync('pgrep', ['-f', `runners/${name}.mjs`], { stdio: 'ignore' }); return true; }
+  catch { return false; }
+}
+
 // 需要保持可见的 tab：state 文件 → 字段名
 function wantVisible() {
   const out = [];
@@ -88,9 +96,16 @@ function wantVisible() {
   //    而"tab 没了"会绕过速率闸门直接触发自愈 —— 于是每轮都判定要修，
   //    一直重启 runner。2026-08-04 停掉浙江工信之后立刻踩到（幸好指数退避拦住了）。
   const disabled = k => fs.existsSync(path.join(HERE, 'state', `DISABLED-${k}`));
-  const zj = disabled('zjsjczx') ? null : read('zjsjczx.json');
+  // 🔴 同理，**runner 自己没在跑的时候，它的 tab 缺失也不算症状**。
+  //    "tab 没了"会绕过下面的速率闸门直接触发自愈，而自愈 = pkill 全部 runner + 重建窗口。
+  //    于是"163 因故退出 → 它的 tab 变成孤儿 → 每轮判定要修 → 连带把正在正常播放的
+  //    zj/hz 一起打回 0%"，而重启完 163 还是起不来，症状永远消不掉。
+  //    2026-08-21 实测到这条链（163 把空课程列表当成学完了退出，见 runners/study163.mjs）。
+  //    tab 该不该在，取决于**它的主人在不在**：DISABLED 是人工不在，进程没了是事实不在。
+  const skip = k => disabled(k) || !running(k);
+  const zj = skip('zjsjczx') ? null : read('zjsjczx.json');
   if (zj?.target) out.push({ who: 'zj', tab: zj.target });
-  const nc = disabled('study163') ? null : read('study163.json');
+  const nc = skip('study163') ? null : read('study163.json');
   if (nc) for (const [k, v] of Object.entries(nc)) if (/^tab\d+$/.test(k) && v) out.push({ who: `163-${k}`, tab: v });
   return out;
 }

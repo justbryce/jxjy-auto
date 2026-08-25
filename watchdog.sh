@@ -17,8 +17,13 @@ CDP_PROXY="${CDP_PROXY:-http://localhost:3456}"
 # 代理进程活着、但连不上 Chrome —— 这种情况下三个 runner 只会一直 timeout 空转。
 # 典型原因：代理重连时 Chrome 弹了「允许调试」授权框，而机器锁屏没人点
 # （那个同意状态是 per-instance 的内存标志，Chrome 配置里没有持久化，只能人工点）。
+# ⚠️ 判据只认**明确的** "connected":false，不能写成 `! grep connected":true`。
+#    老版本的代理 /health 只返回 {"ok":true,"chromePort":9222}，压根没有 connected 字段 ——
+#    那种写法会每 5 分钟无条件报一次"连不上 Chrome"，而代理其实好好的。
+#    假警报比没有警报更糟（见 AGENTS.md 第二类第 6 条），所以字段缺失时**保持沉默**：
+#    代理是自己重启后才会带上这个字段的，在那之前这项检查降级为不检查。
 HEALTH=$(curl -sf -m 5 "$CDP_PROXY/health" 2>/dev/null)
-if [ -n "$HEALTH" ] && ! echo "$HEALTH" | grep -q '"connected":true'; then
+if echo "$HEALTH" | grep -q '"connected":false'; then
   echo "$(ts) 🚨 CDP 代理活着但连不上 Chrome（多半是授权弹窗没人点 / 机器锁屏）" >> logs/ALERT.log
   osascript -e 'display notification "CDP 代理连不上 Chrome，请解锁机器并在 Chrome 里点「允许」调试授权" with title "继续教育自动学习"' 2>/dev/null
 fi

@@ -12,11 +12,14 @@
 //
 // 学习顺序：**不要硬编码**，读平台后台自己给的年度要求（`data.study` 里每类的 r/s，见 finished()）。
 // 谁还差就先补谁；硬性要求都满了再拿没有下限的类别去填总学时。
-// （这个账号 2026 年是：专业课程 60 / 行业公需 0 / 一般公需 0 / 总学时 90，
-//   别的账号未必一样，所以只能现查。）
+// （这个账号 2026 年是：专业课程 60 / 行业公需 0 / 一般公需 0 / 总学时 90。
+//   ⚠️ 那两个 0 是**分项**下限，不等于"公需不用学"——页面文案另有一条
+//   「行业公需和一般公需科目不少于 18.0 学时」的**合并**下限，而 data.study 里没有这个字段，
+//   接口全文都搜不到 18。见下面的 GX_MIN。别的账号未必一样，所以分项只能现查。）
 
 import * as cdp from '../lib/cdp.mjs';
 import { sleep, evalJs, evalJson } from '../lib/cdp.mjs';
+import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -32,6 +35,10 @@ const state = cdp.makeState(path.join(HERE, '../state/hzrs.json'));
 // 课程类别 typeid：15 专业课程 / 16 行业公需 / 17 一般公需
 const TYPE_ORDER = [15, 16, 17];
 const TYPE_NAME = { 15: '专业课程', 16: '行业公需', 17: '一般公需' };
+
+// 公需（行业+一般）的**合并**下限。只写在平台页面文案里，`data.study` 的分项 r 都是 0.0，
+// 接口返回全文里也搜不到这个数 —— 读不出来，只能硬编码。
+const GX_MIN = 18;
 
 // 🔑「专业方向」的权威字段是 professional_field_id（专业领域/行业系列），
 //    **不是** min_catelogname（学科门类，列表卡片上那个 [工学] 角标）—— 两者完全正交。
@@ -141,21 +148,61 @@ async function crossGap() {
 }
 
 // ---- 别人在学吗 ----
+// 🔴 判据不能只看 `state.data.cls`（当前这一门）。runner 被 pkill/自愈重启时，
+//    上一代开的 class tab 还留在 Chrome 里，而 state 里的 cls 可能是更早的、已经死掉的 id
+//    （两代进程重叠时 state.save() 是最后写的赢）。于是**它把自己的孤儿 tab 当成了"用户本人在学"**，
+//    每 5 分钟让一次路、永远让下去 —— 进程活着、日志在滚、学时零增长。
+//    2026-08-21 实测：连着让路 10 分钟以上，且没有任何机制能自己走出来。
+//    所以按 163 的做法记下**我们开过的所有 class tab**，只有不在这个集合里的才算别人的。
 async function foreignClassTab(mine) {
+  const owned = new Set([mine, ...(state.data.owned || [])].filter(Boolean));
   const ts = await cdp.findTabs(t => t.url.includes('learning.hzrs.hangzhou.gov.cn/#/class'));
-  return ts.find(t => t.targetId !== mine) || null;
+  return ts.find(t => !owned.has(t.targetId)) || null;
 }
 
 // ---- 播课 ----
 async function openClass(courseId) {
   if (state.data.cls && await cdp.tabAlive(state.data.cls)) await cdp.closeTab(state.data.cls);
   const r = await cdp.newTab(`${ORIGIN}/#/class?courseId=${courseId}`);
-  state.data.cls = r.targetId; state.save();
+  state.data.cls = r.targetId;
+  // 记账用来区分"我们的 tab"和"用户自己开的"（见 foreignClassTab）。
+  // ⚠️ 淘汰依据只能是"它还活着吗"，**不能按数量截断** —— 一个 tab 能活多久，
+  //    跟"这之后又开了几门课"毫无关系。2026-08-25 踩过：一个 8/21 09:40 开的 class tab
+  //    活了 4 天，被原来的 slice(-20) 挤出记账后，runner 把**自己的**孤儿认成了用户本人，
+  //    每 5 分钟让路一次、永远走不出来（第二类第 9 条：进程活着、日志在滚、学时零增长）。
+  //    按存活过滤同样不会无限涨 —— 上限就是 Chrome 里实际还开着的 tab 数。
+  const live = new Set((await cdp.findTabs(() => true)).map(t => t.targetId));
+  state.data.owned = [...(state.data.owned || []).filter(id => live.has(id)), r.targetId];
+  state.save();
   await sleep(7000);
   // Chrome 常把新 tab 扔进一个位置随机的新窗口，容易压住 163 那两个必须保持可见的小窗口。
   // 本站不需要可见（学时按页面墙钟计），挪到屏幕下方停着。
   cdp.parkWindow('#/class?courseId=', [0, 620, 700, 1060]);
+  await restoreDedicatedTabs();
   return r.targetId;
+}
+
+// 🔴 新建 tab 会被 Chrome 塞进**最后获得焦点的那个窗口** —— 那很可能正是 163 的专用窗口。
+// 一进去它就成了那个窗口的**活动 tab**，163 自己的 tab 退居后台变 hidden，
+// 而 163 是 SPA：hidden 页被密集节流后**连 <video> 元素都挂载不出来**，
+// 于是那个 worker 每个课时都"起播失败"，失败计数一路烧。
+// 2026-08-21 实测：163-w1 的窗口被 class tab 占了活动位，6 分钟烧掉 8 个课时的计数。
+// ⚠️ parkWindow 救不了这种情况 —— 它只认"整窗只有 1 个 tab"，而这时候那窗口有 2 个。
+//
+// 本站不需要可见（学时按页面墙钟计，parkWindow 本来就是把它挪到屏幕角落），
+// 所以开完课就把别人的专用 tab 重新设回各自窗口的活动 tab。让出去不花我们一分钱。
+async function restoreDedicatedTabs() {
+  for (const f of ['study163.json', 'zjsjczx.json']) {
+    let d;
+    try { d = JSON.parse(fs.readFileSync(path.join(HERE, '../state/' + f), 'utf8')); } catch { continue; }
+    for (const [k, v] of Object.entries(d)) {
+      if (!/^(tab\d+|target)$/.test(k) || typeof v !== 'string') continue;
+      if (await cdp.tabAlive(v)) {
+        await cdp.front(v).catch(() => { });
+        log(`  把 ${f.replace('.json', '')} 的专用 tab 设回其窗口的活动 tab（本站不需要可见）`);
+      }
+    }
+  }
 }
 
 // 页面里装个钩子，抓 updateStudy 的 playTime / finish，用来判断"计时到底有没有在走"
@@ -322,11 +369,14 @@ async function loop() {
     const doneSet = new Set([...mine.map(x => x.id), ...fin.ids, ...black, ...Object.keys(done)]);
     let pick = null, already = 0;
 
-    // 🔑 学什么，由平台后台的权威要求决定，别硬编码。这个账号（2026）是：
+    // 🔑 学什么，由平台后台的权威要求决定，别硬编码。这个账号（2026）接口给的是：
     //      专业课程 要求 60 · 行业公需 要求 0 · 一般公需 要求 0 · 总学时 要求 90
-    //    也就是说 60 学时**必须**是专业课程，剩下 30 学时任何类别都行（公需不设下限但计入总数）。
-    //    → 专业课程还没补满就先刷专业课程；补满了再拿公需去填总学时的余量。
-    //    （历史教训：曾按"公需≥18"的传闻先刷公需，而这个账号公需要求其实是 0。）
+    //    但**接口只给分项下限**，页面文案上还有一条合并下限：
+    //      「行业公需和一般公需科目不少于 18.0 学时」——`data.study` 里没有这个字段。
+    //    所以正确的读法是：60 必须是专业课程，公需两类**合计**至少 18，总数 90。
+    //    → 公需没到 18 先补公需（本站一般公需最便宜）；到了再看专业课补没补满。
+    //    （历史教训：曾以为"公需≥18"只是传闻、把分项的 r=0.0 读成"公需不设下限"——
+    //      错在把"这一类单独没有下限"当成了"这一类不用学"。2026-08-25 由页面文案纠正。）
     // 🔴 登录态一掉，`data.study` 就返回空 → 所有要求都读成 0 → 调度器认为"什么都不缺"
     //    → 一路走到下面的 `return 'finished'`，**进程直接退出，看门狗也不会再拉起来**。
     //    2026-08-04 10:31 就这么退了：阿布正在重新登录，runner 已经收工走人了。
@@ -367,8 +417,8 @@ async function loop() {
         ? `跨平台公需还差 ${cross.gxLeft.toFixed(1)}（本站一般公需最便宜），先补公需`
         : `跨平台公需已达标，专业还差 ${cross.specLeft.toFixed(1)}，刷专业课`;
     } else {
-      gxFirst = specDone >= spec.r;
-      why = `（拿不到跨平台数，按本站要求）专业 ${specDone.toFixed(1)}/${spec.r}`;
+      gxFirst = gxDone < GX_MIN || specDone >= spec.r;
+      why = `（拿不到跨平台数，按本站要求）专业 ${specDone.toFixed(1)}/${spec.r} 公需 ${gxDone.toFixed(1)}/${GX_MIN}`;
     }
     const order = gxFirst ? [17, 16, 15] : [15, 17, 16];
     log(`${why}｜本站：专业 ${specDone.toFixed(1)} 公需 ${gxDone.toFixed(1)}（官方计入 ${spec.s}/${gxSettled}）`);
